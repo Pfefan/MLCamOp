@@ -1,0 +1,21 @@
+# Core ML
+torch
+torchvision
+
+# Video processing
+opencv-python
+moviepy
+ffmpeg-python
+pydub
+
+# Data / Utils
+numpy
+pandas
+scikit-learn
+PyYAML
+matplotlib
+
+# Dev / Test
+pytest
+jupyter
+ipykernel

@@ -1,0 +1,18 @@
+{
+    "python.defaultInterpreterPath": "C:\\Users\\Stefan\\source\\repos\\MLCamOp\\venv\\Scripts\\python311.exe",
+    "python.pythonPath": "C:\\Users\\Stefan\\source\\repos\\MLCamOp\\venv\\Scripts\\python311.exe",
+    "pylint.args": [
+        "--rcfile=${workspaceFolder}/.pylintrc"
+    ],
+    "pylint.path": [
+        "${workspaceFolder}/venv/Scripts/pylint"
+    ],
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}"
+    ],
+    "python.analysis.venvPath": "C:\\Users\\Stefan\\source\\repos\\MLCamOp",
+    "python.venvPath": "C:\\Users\\Stefan\\source\\repos\\MLCamOp",
+    "editor.formatOnSave": true,
+    "files.insertFinalNewline": true,
+    "files.trimTrailingWhitespace": true
+}

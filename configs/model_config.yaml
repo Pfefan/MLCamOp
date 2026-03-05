@@ -1,0 +1,36 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Video paths
+# Put the filenames of your 3 concert videos here.
+# ─────────────────────────────────────────────────────────────────────────────
+data:
+  total_view: "E:/Job/Projekte/CutStudio/03_StadtorchesterJan2026/input/TOTALLE.mp4"
+  closeup:    "E:/Job/Projekte/CutStudio/03_StadtorchesterJan2026/input/CLOSEUP.mp4"
+  result:     "E:/Job/Projekte/CutStudio/03_StadtorchesterJan2026/input/SCHNITT.mp4"
+  # 1.0 = sample 1 frame per second from the 65-minute video → ~3900 frames
+  # Increase to 2.0 or 5.0 once you've verified the labels look correct
+  sample_fps: 1.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training hyperparameters
+# ─────────────────────────────────────────────────────────────────────────────
+training:
+  epochs: 20
+  batch_size: 32       # RTX 3060 12GB handles this fine at 224x224
+  learning_rate: 0.0001
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model architecture
+# ─────────────────────────────────────────────────────────────────────────────
+model:
+  name: ViewClassifier
+  backbone: mobilenet_v3_small   # Lightweight, fast, pretrained on ImageNet
+  num_classes: 2                 # 0 = wide shot, 1 = close-up
+  input_size: [224, 224]
+  checkpoint: "models/view_classifier.pt"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+logging:
+  log_file: "logs/training.log"
+  level: INFO
