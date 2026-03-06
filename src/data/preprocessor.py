@@ -1,66 +1,53 @@
-"""Video preprocessing utilities: resizing, normalization, frame extraction."""
+"""
+Frame-level preprocessing utilities.
+
+These are thin helpers used by the training pipeline.  Heavy video I/O
+(opening files, seeking, sampling) lives in ``src.data.sampler``.
+"""
 
 import cv2
 import numpy as np
 
 
-def preprocess_video(
-    input_video_path: str,
-    output_video_path: str,
-    target_size: tuple[int, int] = (640, 480),
-) -> None:
-    """
-    Resize all frames of a video and write to a new file.
-
-    Args:
-        input_video_path: Path to source video.
-        output_video_path: Path to write resized video.
-        target_size: (width, height) tuple for output frames.
-    """
-    cap = cv2.VideoCapture(input_video_path)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_video_path, fourcc, 30.0, target_size)
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_resized = cv2.resize(frame, target_size)
-        out.write(frame_resized)
-
-    cap.release()
-    out.release()
-
-
 def normalize_frame(frame: np.ndarray) -> np.ndarray:
     """
-    Normalize pixel values to [0, 1].
+    Normalize pixel values from [0, 255] to [0.0, 1.0].
 
     Args:
-        frame: Input frame as numpy array.
+        frame: Input BGR frame.
 
     Returns:
-        Normalized frame as float32 array.
+        Float32 array with values in [0.0, 1.0].
     """
     return (frame / 255.0).astype(np.float32)
 
 
 def extract_frames(video_path: str, frame_interval: int = 30) -> list[np.ndarray]:
     """
-    Extract every nth frame from a video, normalized to [0, 1].
+    Extract every *frame_interval*-th frame from a video, normalized to [0, 1].
+
+    Note: this reads the video sequentially and loads all extracted frames into
+    RAM.  For large files prefer ``src.data.sampler.generate_training_data``
+    which uses seek-based sampling and disk caching.
 
     Args:
-        video_path: Path to the video file.
-        frame_interval: Extract one frame every this many frames.
+        video_path:     Path to the video file.
+        frame_interval: Keep one frame every this many frames.
 
     Returns:
-        List of normalized frames.
+        List of normalized float32 frames.
+
+    Raises:
+        ValueError: If the video file cannot be opened.
     """
-    frames = []
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+
+    frames: list[np.ndarray] = []
     count = 0
 
-    while cap.isOpened():
+    while True:
         ret, frame = cap.read()
         if not ret:
             break

@@ -12,43 +12,63 @@ from src.utils.logger import setup_logger
 def train_model(config: dict) -> None:
     """
     Full training pipeline:
-      1. Sample frames from total_view + result videos.
-      2. Label each frame (wide=0, close-up=1) by comparing to the result.
-      3. Train a MobileNetV3 classifier on those labelled frames.
-      4. Save the best model weights to disk.
-
-    Args:
-        config: Parsed YAML config dict from configs/model_config.yaml.
+      1. Sample frames from each concert's total_view + closeup + result (cached).
+      2. Concatenate all concerts into one dataset.
+      3. Train with class-balanced loss, augmentation, AMP, early stopping.
+      4. Save best checkpoint to disk.
     """
     logger = setup_logger(config["logging"]["log_file"])
 
-    logger.info("Generating training data from videos...")
-    logger.info("  total_view : %s", config["data"]["total_view"])
-    logger.info("  result     : %s", config["data"]["result"])
+    concerts   = config["data"]["concerts"]
+    sample_fps = config["data"].get("sample_fps", 1.0)
+    threshold  = config["data"].get("similarity_threshold", 65.9)
+    cache_dir  = config["data"].get("cache_dir", "data/cache")
+    force_rebuild = config["data"].get("force_rebuild", False)
 
-    frames, labels = generate_training_data(
-        total_view_path=config["data"]["total_view"],
-        result_path=config["data"]["result"],
-        sample_fps=config["data"].get("sample_fps", 1.0),
-    )
+    all_frames: list = []
+    all_labels: list = []
 
-    if not frames:
-        logger.error("No frames were sampled. Check your video paths in configs/model_config.yaml.")
+    for i, concert in enumerate(concerts, start=1):
+        logger.info("Concert %d/%d — loading frames...", i, len(concerts))
+        logger.info("  total_view : %s", concert["total_view"])
+        logger.info("  closeup    : %s", concert["closeup"])
+        logger.info("  result     : %s", concert["result"])
+
+        frames, labels = generate_training_data(
+            total_view_path      = concert["total_view"],
+            closeup_path         = concert["closeup"],
+            result_path          = concert["result"],
+            sample_fps           = sample_fps,
+            similarity_threshold = threshold,
+            cache_dir            = cache_dir,
+            force_rebuild        = force_rebuild,
+        )
+        all_frames.extend(frames)
+        all_labels.extend(labels)
+
+    if not all_frames:
+        logger.error("No frames sampled. Check video paths in configs/model_config.yaml.")
         return
 
-    logger.info("Training ViewClassifier on %d frames...", len(frames))
+    logger.info(
+        "Total training data: %d frames from %d concert(s).",
+        len(all_frames), len(concerts),
+    )
+
     classifier = ViewClassifier()
     logger.info("Using device: %s", classifier.device)
 
     classifier.train(
-        frames=frames,
-        labels=labels,
-        epochs=config["training"]["epochs"],
-        batch_size=config["training"]["batch_size"],
-        lr=config["training"]["learning_rate"],
+        frames     = all_frames,
+        labels     = all_labels,
+        epochs     = config["training"]["epochs"],
+        batch_size = config["training"]["batch_size"],
+        lr         = config["training"]["learning_rate"],
+        val_split  = config["training"].get("val_split", 0.2),
+        patience   = config["training"].get("patience", 10),
     )
 
-    save_path = "models/view_classifier.pt"
+    save_path = config["model"]["checkpoint"]
     classifier.save(save_path)
     logger.info("Model saved to %s", save_path)
     logger.info("Training complete.")
@@ -56,15 +76,11 @@ def train_model(config: dict) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train the ViewClassifier.")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/model_config.yaml",
-        help="Path to model config YAML file.",
-    )
+    parser.add_argument("--config", default="configs/model_config.yaml")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     train_model(cfg)
+

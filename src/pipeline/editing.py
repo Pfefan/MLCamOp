@@ -1,74 +1,67 @@
-"""Pipeline stage: assemble final video from total view and close-up frames."""
+"""
+Pipeline stage: assemble the final cut from total-view and close-up frames.
+
+The editing stage takes per-frame classifier labels and produces a single
+output frame sequence: wide frames where label=0, close-up frames where
+label=1.  A minimum shot length is enforced to prevent rapid flicker.
+"""
 
 import cv2
 import numpy as np
 
 
-def edit_video(
+def assemble_cut(
     total_view_frames: list[np.ndarray],
-    close_up_frames: list[np.ndarray],
-    scene_changes: list[int],
+    close_up_frames:   list[np.ndarray],
+    labels:            list[int],
+    min_shot_frames:   int = 10,
 ) -> list[np.ndarray]:
     """
-    Interleave total-view and close-up frames at detected scene change points.
+    Build the output frame sequence by selecting the correct source per label.
+
+    Labels of 0 pull from *total_view_frames*; labels of 1 pull from
+    *close_up_frames*.  A minimum shot length is enforced so the edit doesn't
+    flicker when the classifier oscillates on a single frame.
 
     Args:
-        total_view_frames: Frames from the wide/total camera.
-        close_up_frames: Frames from the close-up camera.
-        scene_changes: Frame indices where a cut to close-up should occur.
+        total_view_frames: Wide-shot frames.  Must be same length as *labels*.
+        close_up_frames:   Close-up frames at the same timestamps.
+        labels:            Per-frame predictions — 0 = wide, 1 = close-up.
+        min_shot_frames:   Minimum number of consecutive frames before a cut
+                           is allowed (suppresses single-frame flicker).
 
     Returns:
-        List of frames for the edited video.
+        Assembled frame sequence ready to be written to disk.
     """
-    edited_video = []
+    if len(total_view_frames) != len(close_up_frames) != len(labels):
+        raise ValueError(
+            "total_view_frames, close_up_frames, and labels must all be the same length."
+        )
 
-    for i, frame in enumerate(total_view_frames):
-        edited_video.append(frame)
-        if i < len(scene_changes) and scene_changes[i] < len(close_up_frames):
-            edited_video.append(close_up_frames[scene_changes[i]])
+    smoothed = _enforce_min_shot_length(labels, min_shot_frames)
 
-    return edited_video
+    result: list[np.ndarray] = []
+    for i, label in enumerate(smoothed):
+        result.append(total_view_frames[i] if label == 0 else close_up_frames[i])
 
-
-def apply_transitions(
-    edited_video: list[np.ndarray],
-    transition_effects: list[np.ndarray],
-) -> list[np.ndarray]:
-    """
-    Insert transition frames between cuts in the edited video.
-
-    Args:
-        edited_video: Sequence of video frames.
-        transition_effects: Frames to insert as transitions.
-
-    Returns:
-        Video frames with transitions inserted.
-    """
-    final_video = []
-
-    for i in range(len(edited_video) - 1):
-        final_video.append(edited_video[i])
-        if i < len(transition_effects):
-            final_video.append(transition_effects[i])
-
-    if edited_video:
-        final_video.append(edited_video[-1])
-
-    return final_video
+    return result
 
 
-def save_edited_video(
-    frames: list[np.ndarray],
+def save_video(
+    frames:      list[np.ndarray],
     output_path: str,
-    fps: float = 30.0,
+    fps:         float = 25.0,
 ) -> None:
     """
-    Write assembled frames to a video file.
+    Write an assembled frame sequence to a video file.
 
     Args:
-        frames: List of frames to write.
-        output_path: Destination file path.
-        fps: Frames per second for output video.
+        frames:      Frames to write (must all be the same resolution).
+        output_path: Destination file path (MP4).
+        fps:         Output frames per second.  Should match source FPS.
+
+    Raises:
+        ValueError: If *frames* is empty.
     """
     if not frames:
         raise ValueError("Cannot save empty frame list.")
@@ -83,27 +76,38 @@ def save_edited_video(
     writer.release()
 
 
-def process_video(
-    total_view_frames: list[np.ndarray],
-    close_up_frames: list[np.ndarray],
-    scene_changes: list[int],
-    transition_effects: list[np.ndarray],
-    output_path: str,
-) -> list[np.ndarray]:
+# ── Private helpers ───────────────────────────────────────────────────────────
+
+def _enforce_min_shot_length(labels: list[int], min_frames: int) -> list[int]:
     """
-    Full editing pipeline: edit, add transitions, and save.
+    Suppress label flips that last fewer than *min_frames* frames.
+
+    Walks through the label sequence and converts isolated short runs back to
+    the surrounding majority label, preventing rapid-fire cuts in output.
 
     Args:
-        total_view_frames: Wide-shot frames.
-        close_up_frames: Close-up frames.
-        scene_changes: Indices of scene cut points.
-        transition_effects: Transition frames to insert.
-        output_path: Path to write the final video.
+        labels:     Per-frame label list.
+        min_frames: Minimum run length to keep.
 
     Returns:
-        The final assembled list of frames.
+        Smoothed label list of the same length.
     """
-    edited = edit_video(total_view_frames, close_up_frames, scene_changes)
-    final = apply_transitions(edited, transition_effects)
-    save_edited_video(final, output_path)
-    return final
+    if not labels or min_frames <= 1:
+        return list(labels)
+
+    smoothed = list(labels)
+    i = 0
+    while i < len(smoothed):
+        current = smoothed[i]
+        run_end = i + 1
+        while run_end < len(smoothed) and smoothed[run_end] == current:
+            run_end += 1
+        run_length = run_end - i
+        if run_length < min_frames and i > 0:
+            # Replace this short run with the previous label
+            prev_label = smoothed[i - 1]
+            for j in range(i, run_end):
+                smoothed[j] = prev_label
+        i = run_end
+
+    return smoothed

@@ -214,3 +214,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# MLCamOp — large generated files
+data/cache/          # preprocessed frame tensors (can be rebuilt from raw video)
+logs/
+models/*.pt
+
+# custom
+*.pt

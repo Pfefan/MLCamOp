@@ -1,38 +1,38 @@
-"""Render the final edited video from assembled frame sequences."""
+"""
+Postprocessing: render the final edited video to disk.
+
+Takes the assembled frame sequence from ``src.pipeline.editing.assemble_cut``
+and writes it to an MP4 file, preserving the source video's FPS and resolution.
+"""
 
 import cv2
 import numpy as np
 
 
-def render_final_video(
-    total_view_frames: list[np.ndarray],
-    close_up_frames: list[np.ndarray],
+def render_video(
+    frames:      list[np.ndarray],
     output_path: str,
-    fps: float = 30.0,
+    fps:         float = 25.0,
 ) -> None:
     """
-    Combine total-view and close-up frames and write to a video file.
+    Write an assembled frame sequence to an MP4 file.
 
     Args:
-        total_view_frames: Frames from the wide camera.
-        close_up_frames: Frames from the close-up camera.
+        frames:      Frames to write (all must be the same resolution).
         output_path: Destination file path.
-        fps: Output frames per second.
+        fps:         Output frames per second.  Should match your source cameras.
+
+    Raises:
+        ValueError: If *frames* is empty.
     """
-    final_frames: list[np.ndarray] = []
+    if not frames:
+        raise ValueError("Cannot render empty frame sequence.")
 
-    for total_frame, close_frame in zip(total_view_frames, close_up_frames):
-        final_frames.append(total_frame)
-        final_frames.append(close_frame)
-
-    if not final_frames:
-        return
-
-    height, width = final_frames[0].shape[:2]
+    height, width = frames[0].shape[:2]
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    for frame in final_frames:
-        out.write(frame)
+    for frame in frames:
+        writer.write(frame)
 
-    out.release()
+    writer.release()

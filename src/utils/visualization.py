@@ -1,26 +1,57 @@
-def visualize_frame(frame, predictions, title="Frame Visualization"):
-    import cv2
-    import numpy as np
+"""Debug visualization helpers for inspecting frame predictions."""
 
-    # Create a copy of the frame to draw on
-    output_frame = frame.copy()
+import cv2
+import numpy as np
 
-    # Draw predictions on the frame
-    for prediction in predictions:
-        label, confidence, bbox = prediction
-        x, y, w, h = bbox
-        cv2.rectangle(output_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        cv2.putText(output_frame, f"{label}: {confidence:.2f}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+from src.models.view_classifier import ViewClassifier
 
-    # Display the frame
-    cv2.imshow(title, output_frame)
-    cv2.waitKey(1)  # Wait for a short period to display the frame
 
-def visualize_video(video_path, model, frame_interval=30):
-    import cv2
+def visualize_frame(
+    frame:       np.ndarray,
+    label:       int,
+    confidence:  float | None = None,
+    title:       str          = "Frame",
+) -> None:
+    """
+    Overlay the predicted label on a frame and show it in an OpenCV window.
 
+    Args:
+        frame:      BGR frame to display.
+        label:      Predicted class — 0 = wide, 1 = close-up.
+        confidence: Optional prediction confidence (0–1) to show alongside.
+        title:      Window title.
+    """
+    output = frame.copy()
+    label_text = "wide" if label == 0 else "close-up"
+    text = f"{label_text} ({confidence:.2f})" if confidence is not None else label_text
+    color = (0, 200, 0) if label == 0 else (0, 80, 255)   # green = wide, orange = close-up
+    cv2.putText(output, text, (12, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+    cv2.imshow(title, output)
+    cv2.waitKey(1)
+
+
+def visualize_video(
+    video_path:     str,
+    classifier:     ViewClassifier,
+    frame_interval: int = 30,
+) -> None:
+    """
+    Play a video in a window with per-frame label overlays.
+
+    Samples every *frame_interval* frames to keep display smooth.
+    Press any key to quit early.
+
+    Args:
+        video_path:     Path to the video file.
+        classifier:     Trained ViewClassifier instance.
+        frame_interval: Show a prediction every N frames.
+    """
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+
     frame_count = 0
+    current_label = 0   # hold last known label between sample points
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -28,10 +59,13 @@ def visualize_video(video_path, model, frame_interval=30):
             break
 
         if frame_count % frame_interval == 0:
-            predictions = model.predict(frame)  # Assuming model has a predict method
-            visualize_frame(frame, predictions)
+            current_label = classifier.predict(frame)
 
+        visualize_frame(frame, current_label, title="Preview")
         frame_count += 1
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
 
     cap.release()
     cv2.destroyAllWindows()

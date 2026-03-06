@@ -1,36 +1,57 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Video paths
-# Put the filenames of your 3 concert videos here.
+#
+# Add more concerts to the list as you record them.  Each entry needs the three
+# simultaneous recordings: wide shot (total_view), close-up camera (closeup),
+# and the human-edited final cut (result).
+#
+# The sampler builds a separate cache file per concert (keyed by path + settings)
+# so adding a new concert never invalidates existing caches — it just adds one
+# new cache file.  Set force_rebuild: true only if you change sample_fps or
+# similarity_threshold.
 # ─────────────────────────────────────────────────────────────────────────────
 data:
-  total_view: "E:/Job/Projekte/CutStudio/03_StadtorchesterJan2026/input/TOTALLE.mp4"
-  closeup:    "E:/Job/Projekte/CutStudio/03_StadtorchesterJan2026/input/CLOSEUP.mp4"
-  result:     "E:/Job/Projekte/CutStudio/03_StadtorchesterJan2026/input/SCHNITT.mp4"
-  # 1.0 = sample 1 frame per second from the 65-minute video → ~3900 frames
-  # Increase to 2.0 or 5.0 once you've verified the labels look correct
-  sample_fps: 1.0
+  concerts:
+    - total_view: "E:/Job/Projekte/CutStudio/03_StadtorchesterJan2026/input/TOTALLE.mp4"
+      closeup:    "E:/Job/Projekte/CutStudio/03_StadtorchesterJan2026/input/CLOSEUP.mp4"
+      result:     "E:/Job/Projekte/CutStudio/03_StadtorchesterJan2026/input/SCHNITT.mp4"
+    # Add future concerts here, e.g.:
+    # - total_view: "E:/Job/Projekte/CutStudio/04_SomeConcert/input/TOTALLE.mp4"
+    #   closeup:    "E:/Job/Projekte/CutStudio/04_SomeConcert/input/CLOSEUP.mp4"
+    #   result:     "E:/Job/Projekte/CutStudio/04_SomeConcert/input/SCHNITT.mp4"
+
+  sample_fps:           2.0
+  similarity_threshold: 39
+
+  # Preprocessed frame cache — avoids re-reading 3×7 GB on every run.
+  # Each concert gets its own cache file keyed by its paths + settings.
+  cache_dir:    "data/cache"
+  force_rebuild: false
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training hyperparameters
 # ─────────────────────────────────────────────────────────────────────────────
 training:
-  epochs: 20
-  batch_size: 32       # RTX 3060 12GB handles this fine at 224x224
-  learning_rate: 0.0001
+  epochs:        40
+  batch_size:    32          # smaller batches = more gradient updates per epoch
+  learning_rate: 0.0003      # classification head only; backbone is fully frozen
+  val_split:     0.2
+  patience:      15
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model architecture
+# Model
 # ─────────────────────────────────────────────────────────────────────────────
 model:
-  name: ViewClassifier
-  backbone: mobilenet_v3_small   # Lightweight, fast, pretrained on ImageNet
-  num_classes: 2                 # 0 = wide shot, 1 = close-up
-  input_size: [224, 224]
-  checkpoint: "models/view_classifier.pt"
+  name:        ViewClassifier
+  backbone:    mobilenet_v3_small
+  num_classes: 2
+  input_size:  [224, 224]
+  checkpoint:  "models/view_classifier.pt"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
 logging:
   log_file: "logs/training.log"
-  level: INFO
+  level:    INFO
+
