@@ -1,62 +1,69 @@
-# Concert Video Editor
+# Concert Video Editor (MLCamOp)
 
-## Overview
-The Concert Video Editor is a machine learning project designed to process video inputs from concerts. It combines total view and close-up view footage to produce a final edited video output. The project leverages various machine learning models to classify views, detect scenes, and compose the final video.
+Auto-cut between wide-shot and close-up concert cameras using a fine-tuned MobileNetV3-Small classifier.
 
-## Project Structure
-The project is organized into several directories, each serving a specific purpose:
+## How it works
 
-- **src/**: Contains the main source code for the application.
-  - **config/**: Configuration settings for the project.
-  - **data/**: Functions for loading and preprocessing video data.
-  - **models/**: Machine learning models for view classification and scene detection.
-  - **features/**: Functions for audio analysis and frame extraction.
-  - **pipeline/**: Processing pipeline for ingesting, inferring, and editing videos.
-  - **postprocessing/**: Functions for rendering the final video output.
-  - **utils/**: Utility functions for video I/O and logging.
+1. **Labelling** — Given three synchronised videos per concert (wide, close-up, human-edited result), the sampler compares each result frame against both cameras via pixel-diff to generate `wide (0)` / `close-up (1)` labels.
+2. **Training** — MobileNetV3-Small is fine-tuned on those labelled frames with differential learning rates, class weighting, augmentation, AMP, and early stopping.
+3. **Inference** — The trained model classifies frames of a new wide-shot video; a short-shot filter smooths the predictions.
+4. **Assembly** — Frames are picked from wide or close-up based on the predictions and rendered to MP4.
 
-- **tests/**: Contains unit tests for various components of the project.
+## Project structure
 
-- **notebooks/**: Jupyter notebooks for data exploration, model training, and evaluation.
+```
+configs/model_config.yaml   # Video paths, hyperparameters, model checkpoint path
+scripts/
+  train.py                  # Train the classifier
+  evaluate.py               # Evaluate on the held-out concert
+  tune_threshold.py         # Calibrate pixel-diff threshold per concert
+  run_pipeline.py           # End-to-end inference on a concert
+  preview.py                # Quick preview with optional digital-zoom close-up
+src/
+  data/sampler.py           # Frame sampling, labelling, caching
+  models/view_classifier.py # MobileNetV3 classifier (train + predict)
+  models/scene_detector.py  # Heuristic scene-change detector
+  pipeline/inference.py     # Run classifier over a video
+  pipeline/editing.py       # Assemble final cut from labels
+  postprocessing/renderer.py# Write frames to MP4
+  utils/logger.py           # Logging setup
+  utils/visualization.py    # Debug overlays
+tests/                      # Unit tests
+```
 
-- **configs/**: Configuration files for models, pipelines, and logging.
+## Setup
 
-- **scripts/**: Standalone scripts for training, evaluating, and running the pipeline.
-
-- **requirements.txt**: Lists the dependencies required for the project.
-
-- **setup.py**: For packaging the project as a Python package.
-
-- **Makefile**: Commands for building and managing the project.
-
-- **Dockerfile**: For creating a Docker image of the project.
-
-- **.gitignore**: Specifies files and directories to be ignored by version control.
-
-- **.env.example**: Example of environment variables needed for the project.
-
-## Installation
-1. Clone the repository:
-   ```
-   git clone <repository-url>
-   cd concert-video-editor
-   ```
-
-2. Install the required dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-
-3. Set up environment variables by copying `.env.example` to `.env` and modifying as needed.
+```bash
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+```
 
 ## Usage
-To run the processing pipeline, execute the following command:
-```
-python scripts/run_pipeline.py
+
+```bash
+# 1. Calibrate thresholds (once per concert)
+python scripts/tune_threshold.py --config configs/model_config.yaml --concert 0
+
+# 2. Train
+python scripts/train.py --config configs/model_config.yaml
+
+# 3. Evaluate
+python scripts/evaluate.py --config configs/model_config.yaml
+
+# 4. Run on a concert
+python scripts/run_pipeline.py --config configs/model_config.yaml --output output/result.mp4
+
+# 5. Quick preview (single wide-shot, digital zoom as close-up)
+python scripts/preview.py --config configs/model_config.yaml \
+    --input "path/to/wide.mp4" --output output/preview.mp4
 ```
 
-## Contributing
-Contributions are welcome! Please open an issue or submit a pull request for any enhancements or bug fixes.
+## Memory requirements
 
-## License
-This project is licensed under the MIT License. See the LICENSE file for details.
+Training fits in **32 GB RAM** — frames are stored as uint8 numpy arrays (~150 KB each) and preprocessed on-the-fly during training. The cache uses stacked tensors for efficient I/O.
+
+## Tests
+
+```bash
+python -m pytest tests/ -v
+```

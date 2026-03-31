@@ -1,4 +1,4 @@
-"""Logging setup for the concert video editor project."""
+"""Logging setup for the concert video editor."""
 
 import logging
 import os

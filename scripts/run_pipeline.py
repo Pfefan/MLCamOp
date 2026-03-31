@@ -1,19 +1,9 @@
-"""
-End-to-end inference pipeline: classify shots in a new concert and render output.
+"""End-to-end inference: classify shots in a concert and render the output video.
 
 Usage::
 
-    # Run on the first concert defined in config (default)
-    python311 scripts/run_pipeline.py --config configs/model_config.yaml \\
-        --output output/result.mp4
-
-    # Run on a specific concert (0-based index)
-    python311 scripts/run_pipeline.py --config configs/model_config.yaml \\
-        --concert 1 --output output/result_concert2.mp4
-
-This script is the production entry point once the model is trained.
-It does NOT re-train — run ``scripts/train.py`` for that.
-For a quick visual sanity-check with a single video, use ``scripts/preview.py``.
+    python scripts/run_pipeline.py --config configs/model_config.yaml --output output/result.mp4
+    python scripts/run_pipeline.py --config configs/model_config.yaml --concert 1 --output output/result.mp4
 """
 
 import argparse
@@ -35,20 +25,7 @@ def _read_frames_at_timestamps(
     timestamps: list[float],
     fps:        float,
 ) -> list[np.ndarray]:
-    """
-    Seek-based frame reader: extract frames at the given timestamps (seconds).
-
-    Args:
-        path:       Video file path.
-        timestamps: Sample timestamps in seconds.
-        fps:        Video FPS used to convert timestamps to frame indices.
-
-    Returns:
-        List of BGR frames, same length as *timestamps*.
-
-    Raises:
-        ValueError: If the video cannot be opened.
-    """
+    """Seek-based frame reader: extract frames at the given timestamps (seconds)."""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {path}")
@@ -68,15 +45,7 @@ def _read_frames_at_timestamps(
 
 
 def run_pipeline(config: dict, output_path: str, concert_index: int = 0) -> None:
-    """
-    Load the trained model, classify every sampled frame in total_view,
-    assemble the cut from total_view + closeup, and write the result to disk.
-
-    Args:
-        config:        Loaded model_config.yaml dict.
-        output_path:   Where to write the final MP4.
-        concert_index: Which concert in ``config["data"]["concerts"]`` to process.
-    """
+    """Load model, classify frames, assemble cut, and render the output video."""
     logger = setup_logger(config["logging"]["log_file"])
 
     concerts = config["data"]["concerts"]

@@ -4,18 +4,15 @@ torchvision
 
 # Video processing
 opencv-python
-moviepy
-ffmpeg-python
-pydub
 
 # Data / Utils
 numpy
-pandas
 scikit-learn
 PyYAML
-matplotlib
+tqdm
 
 # Dev / Test
 pytest
 jupyter
 ipykernel
+matplotlib

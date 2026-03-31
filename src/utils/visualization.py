@@ -12,15 +12,7 @@ def visualize_frame(
     confidence:  float | None = None,
     title:       str          = "Frame",
 ) -> None:
-    """
-    Overlay the predicted label on a frame and show it in an OpenCV window.
-
-    Args:
-        frame:      BGR frame to display.
-        label:      Predicted class — 0 = wide, 1 = close-up.
-        confidence: Optional prediction confidence (0–1) to show alongside.
-        title:      Window title.
-    """
+    """Overlay predicted label on a frame and display in an OpenCV window."""
     output = frame.copy()
     label_text = "wide" if label == 0 else "close-up"
     text = f"{label_text} ({confidence:.2f})" if confidence is not None else label_text
@@ -35,17 +27,7 @@ def visualize_video(
     classifier:     ViewClassifier,
     frame_interval: int = 30,
 ) -> None:
-    """
-    Play a video in a window with per-frame label overlays.
-
-    Samples every *frame_interval* frames to keep display smooth.
-    Press any key to quit early.
-
-    Args:
-        video_path:     Path to the video file.
-        classifier:     Trained ViewClassifier instance.
-        frame_interval: Show a prediction every N frames.
-    """
+    """Play a video in a window with per-frame label overlays."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {video_path}")

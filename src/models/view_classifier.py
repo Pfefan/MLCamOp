@@ -1,47 +1,10 @@
 """CNN-based binary classifier: wide shot (0) vs close-up (1) per frame.
 
-Architecture
-------------
-MobileNetV3-Small pretrained on ImageNet, fine-tuned on concert footage.
-
-Fine-tuning strategy
---------------------
-- The last feature block of the backbone (features[-1]) is unfrozen and trained
-  with a low learning rate (lr/10).  All earlier backbone layers stay frozen.
-  This lets the model adapt the final convolutional features to concert-specific
-  visual patterns (stage geometry, instrument shapes, lighting) while keeping
-  the early, universal edge/texture detectors intact.
-- Two-layer classification head: Linear → Hardswish → Dropout → Linear,
-  trained at full learning rate.
-- Differential learning rates: backbone block at lr/10, head at lr.
-  This prevents the small pretrained backbone weights from being overwritten
-  too fast while the randomly-initialised head converges.
-
-Class-imbalance handling
-------------------------
-The dataset is ~30% wide / ~70% close-up.  We use a single consistent
-mechanism to correct for this:
-
-  CrossEntropyLoss(weight=[w_wide, w_closeup])
-
-  where w_k = n_total / (K * n_k)   — standard inverse-frequency weighting.
-
-This weights both the training gradient AND the validation loss identically,
-so the model cannot cheat by predicting the majority class.  Using
-WeightedRandomSampler instead creates a train/val distribution mismatch:
-the head learns on 50/50 batches but early stopping is evaluated on a 70/30
-val set, causing the model to oscillate between "all wide" and "all close-up".
-
-Training features
------------------
-- CrossEntropyLoss with inverse-frequency class weights (single mechanism).
-- Balanced accuracy (mean per-class recall) as the early-stopping metric so
-  a model that always predicts one class can never win.
-- On-the-fly augmentation: effectively multiplies the training set.
-- Mixed-precision (AMP): ~2× faster on RTX 3060, lower VRAM use.
-- CosineAnnealingLR: smooth LR decay that works well with fine-tuning.
-- Gradient clipping (max_norm=1.0): prevents large-gradient spikes.
-- Multi-worker DataLoader: uses CPU threads while GPU trains.
+MobileNetV3-Small pretrained on ImageNet, fine-tuned on concert footage with:
+- Differential learning rates (backbone lr/10..lr/100, head lr)
+- Inverse-frequency class weights in CrossEntropyLoss
+- Balanced accuracy as early-stopping metric
+- On-the-fly augmentation, AMP, cosine LR, gradient clipping
 """
 
 import os
@@ -67,9 +30,9 @@ _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 _IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 _INPUT_SIZE    = (224, 224)
 
-# Number of DataLoader workers — use multiple CPU threads on Ryzen 7 7800X
-# 0 = main process (safe on Windows), >0 = parallel (faster but needs
-# if __name__ == "__main__" guard in scripts, which our scripts have)
+# DataLoader workers.  With on-the-fly preprocessing in __getitem__,
+# workers overlap CPU preprocessing with GPU training.  Each worker gets a
+# fork of the process; numpy arrays are copy-on-write so memory is shared.
 _NUM_WORKERS = 4
 
 # Augmentation pipeline applied only during training
@@ -86,13 +49,7 @@ _AUGMENT = T.Compose([
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _preprocess_frame(frame: np.ndarray) -> torch.Tensor:
-    """
-    Convert a single BGR np.ndarray frame to a normalised CHW float tensor.
-
-    Frames coming from the sampler are already stored at 224×224 so the resize
-    is a no-op in normal training use.  It is kept here so this function also
-    works correctly on raw full-resolution frames during inference.
-    """
+    """Convert a BGR uint8 frame to a normalised CHW float tensor."""
     resized = cv2.resize(frame, _INPUT_SIZE)
     rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
     tensor  = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
@@ -100,26 +57,17 @@ def _preprocess_frame(frame: np.ndarray) -> torch.Tensor:
 
 
 def _build_mobilenet(num_classes: int) -> nn.Module:
-    """
-    Load pretrained MobileNetV3-Small and configure for fine-tuning.
-
-    The last feature block (features[-1]) is unfrozen so the model can adapt
-    its final convolutional features to concert-specific visual patterns.
-    All earlier blocks stay frozen — their universal edge/texture detectors
-    are not useful to overwrite with ~8,000 frames.
-
-    Differential learning rates are applied by the caller:
-        backbone block (features[-1]): lr / 10
-        classification head:           lr
-    """
+    """Load pretrained MobileNetV3-Small, freeze all but last two feature blocks."""
     model = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1)
 
     # Freeze the entire backbone first
     for param in model.features.parameters():
         param.requires_grad = False
 
-    # Unfreeze only the last feature block for domain adaptation
+    # Unfreeze the last two feature blocks for domain adaptation
     for param in model.features[-1].parameters():
+        param.requires_grad = True
+    for param in model.features[-2].parameters():
         param.requires_grad = True
 
     # Replace the final linear with a two-layer head
@@ -133,35 +81,36 @@ def _build_mobilenet(num_classes: int) -> nn.Module:
     return model
 
 
-class _AugmentedDataset(torch.utils.data.Dataset):
-    """Wraps pre-processed tensors and applies on-the-fly augmentation for training."""
+class _FrameDataset(torch.utils.data.Dataset):
+    """Dataset that stores raw numpy frames and preprocesses on-the-fly.
 
-    def __init__(self, x: torch.Tensor, y: torch.Tensor, augment: bool = False):
-        self.x       = x
-        self.y       = y
+    Keeping frames as uint8 numpy arrays (150 KB each) instead of float32
+    tensors (600 KB each) cuts memory by 4x.  Preprocessing one frame per
+    __getitem__ call is fast enough that DataLoader workers hide the cost.
+    """
+
+    def __init__(
+        self,
+        frames: list[np.ndarray],
+        labels: list[int],
+        augment: bool = False,
+    ):
+        self.frames  = frames
+        self.labels  = labels
         self.augment = augment
 
     def __len__(self) -> int:
-        return len(self.x)
+        return len(self.frames)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        sample = self.x[idx]
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        tensor = _preprocess_frame(self.frames[idx])
         if self.augment:
-            sample = _AUGMENT(sample)
-        return sample, self.y[idx]
+            tensor = _AUGMENT(tensor)
+        return tensor, self.labels[idx]
 
 
 def _make_class_weights(labels: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """
-    Compute inverse-frequency class weights for CrossEntropyLoss.
-
-    w_k = n_total / (K * n_k)
-
-    This is the standard sklearn-style 'balanced' weighting.  Applied to both
-    training and validation loss so both metrics use the same scale, which
-    prevents the model from winning early stopping by predicting the majority
-    class.
-    """
+    """Inverse-frequency class weights: w_k = n_total / (K * n_k)."""
     counts  = torch.bincount(labels).float()
     weights = counts.sum() / (len(counts) * counts)
     return weights.to(device)
@@ -179,20 +128,9 @@ def _wrap_tqdm(iterable, **kwargs):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ViewClassifier:
-    """
-    Binary classifier: 0 = wide/total shot, 1 = close-up shot.
+    """Binary classifier: 0 = wide/total shot, 1 = close-up shot.
 
-    Wraps a MobileNetV3-Small pretrained on ImageNet, fine-tuned on concert data.
-
-    Example usage::
-
-        clf = ViewClassifier()
-        clf.train(frames, labels)
-        clf.save("models/view_classifier.pt")
-
-        clf2 = ViewClassifier()
-        clf2.load("models/view_classifier.pt")
-        label = clf2.predict(frame)   # 0 or 1
+    Wraps MobileNetV3-Small pretrained on ImageNet, fine-tuned on concert data.
     """
 
     def __init__(self, num_classes: int = 2):
@@ -205,89 +143,50 @@ class ViewClassifier:
 
     def train(
         self,
-        frames:     list[np.ndarray],
-        labels:     list[int],
-        epochs:     int   = 40,
-        batch_size: int   = 32,
-        lr:         float = 3e-4,
-        val_split:  float = 0.2,
-        patience:   int   = 15,
+        train_frames: list[np.ndarray],
+        train_labels: list[int],
+        val_frames:   list[np.ndarray],
+        val_labels:   list[int],
+        epochs:       int   = 40,
+        batch_size:   int   = 32,
+        lr:           float = 3e-4,
+        patience:     int   = 15,
     ) -> None:
-        """
-        Fine-tune the classifier with mixed-precision and early stopping.
-
-        Uses a **stratified shuffled split** so that both the training and
-        validation sets contain a balanced mix of frames from all parts of the
-        concert.  A chronological split (last 20% = finale/bowing section) would
-        make the val set visually unlike the training set on a single concert,
-        giving an artificially pessimistic and unstable accuracy signal.
-
-        Stratification ensures each split has the same class ratio (~30/70) so
-        the class weights remain valid on both sides.
-
-        Note: when you have multiple concerts, switch to a concert-level split
-        (train on concerts 1–N, validate on concert N+1) to measure true
-        generalisation.  For single-concert training, shuffled split is correct.
-
-        Early stopping is on *balanced accuracy* (mean per-class recall) rather
-        than val loss.  A model that always predicts the majority class gets 50%
-        balanced accuracy, not 68%, so it can never win by collapsing.
-
-        Args:
-            frames:     BGR frames stored at 224×224 by the sampler.
-            labels:     0 = wide shot, 1 = close-up, one per frame.
-            epochs:     Maximum number of training epochs.
-            batch_size: Samples per gradient update.
-            lr:         Learning rate for the classification head.
-            val_split:  Fraction of data held out for validation.
-            patience:   Stop early if balanced val accuracy doesn't improve.
-        """
-        print(f"Preprocessing {len(frames)} frames...")
-        x_all = torch.stack([_preprocess_frame(f) for f in frames])
-        y_all = torch.tensor(labels, dtype=torch.long)
-
-        # Stratified shuffle split: preserve class ratio in both splits
-        # while randomising which frames go to train vs val.
-        indices   = torch.randperm(len(x_all), generator=torch.Generator().manual_seed(42))
-        x_all, y_all = x_all[indices], y_all[indices]
-
-        split   = int(len(x_all) * (1 - val_split))
-        x_train, x_val = x_all[:split], x_all[split:]
-        y_train, y_val = y_all[:split], y_all[split:]
-
-        train_ds = _AugmentedDataset(x_train, y_train, augment=True)
-        val_ds   = _AugmentedDataset(x_val,   y_val,   augment=False)
-
-        # persistent_workers requires num_workers > 0
-        _workers    = _NUM_WORKERS
-        _persistent = _workers > 0
+        """Fine-tune with mixed-precision, early stopping on balanced accuracy."""
+        train_ds = _FrameDataset(train_frames, train_labels, augment=True)
+        val_ds   = _FrameDataset(val_frames,   val_labels,   augment=False)
 
         train_loader = DataLoader(
             train_ds, batch_size=batch_size, shuffle=True,
-            num_workers=_workers, persistent_workers=_persistent, pin_memory=True,
+            num_workers=_NUM_WORKERS, pin_memory=True,
+            persistent_workers=_NUM_WORKERS > 0,
         )
         val_loader = DataLoader(
             val_ds, batch_size=batch_size,
-            num_workers=_workers, persistent_workers=_persistent, pin_memory=True,
+            num_workers=_NUM_WORKERS, pin_memory=True,
+            persistent_workers=_NUM_WORKERS > 0,
         )
 
-        # Inverse-frequency class weights applied to BOTH train and val loss.
-        # A model predicting all close-up gets the same weighted loss as one
-        # predicting all wide — neither can win early stopping by collapsing.
+        y_train = torch.tensor(train_labels, dtype=torch.long)
         class_weights = _make_class_weights(y_train, self.device)
         criterion     = nn.CrossEntropyLoss(weight=class_weights)
 
-        # Differential learning rates:
-        #   backbone block (features[-1]): lr/10 — small updates to pretrained weights
-        #   classification head:           lr    — faster convergence for random init
-        backbone_params = [
+        # Differential learning rates — three tiers:
+        #   features[-2]: lr/100 — very slow updates to earlier pretrained block
+        #   features[-1]: lr/10  — moderate updates to final conv block
+        #   classifier head: lr  — full speed for randomly-initialised head
+        backbone_params_deep   = [
+            p for p in self.model.features[-2].parameters() if p.requires_grad
+        ]
+        backbone_params_top = [
             p for p in self.model.features[-1].parameters() if p.requires_grad
         ]
         head_params = list(self.model.classifier.parameters())
         optimizer = torch.optim.AdamW(
             [
-                {"params": backbone_params, "lr": lr / 10},
-                {"params": head_params,     "lr": lr},
+                {"params": backbone_params_deep, "lr": lr / 100},
+                {"params": backbone_params_top,  "lr": lr / 10},
+                {"params": head_params,          "lr": lr},
             ],
             weight_decay=1e-3,
         )
@@ -301,15 +200,18 @@ class ViewClassifier:
         use_amp = self.device.type == "cuda"
         scaler  = GradScaler("cuda", enabled=use_amp)
 
-        n_backbone = sum(p.numel() for p in backbone_params)
-        n_head     = sum(p.numel() for p in head_params)
-        counts     = torch.bincount(y_train)
-        print(f"Training on {len(x_train)} | Validating on {len(x_val)}")
-        print(f"Trainable parameters: {n_backbone + n_head:,}  "
-              f"(backbone block: {n_backbone:,} @ lr/10 + head: {n_head:,} @ lr)")
+        n_deep = sum(p.numel() for p in backbone_params_deep)
+        n_top  = sum(p.numel() for p in backbone_params_top)
+        n_head = sum(p.numel() for p in head_params)
+        counts = torch.bincount(y_train)
+        print(f"Training on {len(train_frames)} | Validating on {len(val_frames)}")
+        print(f"Trainable parameters: {n_deep + n_top + n_head:,}  "
+              f"(features[-2]: {n_deep:,} @ lr/100 | "
+              f"features[-1]: {n_top:,} @ lr/10 | "
+              f"head: {n_head:,} @ lr)")
         print(f"Train class counts — wide: {counts[0].item()}  close-up: {counts[1].item()}")
         print(f"Class weights — wide: {class_weights[0]:.3f}  close-up: {class_weights[1]:.3f}")
-        print(f"Device: {self.device} | AMP: {use_amp} | Workers: {_workers}")
+        print(f"Device: {self.device} | AMP: {use_amp} | Workers: {_NUM_WORKERS}")
 
         best_bal_acc: float           = -1.0
         best_state:   Optional[dict]  = None
@@ -368,9 +270,6 @@ class ViewClassifier:
                 if training:
                     optimizer.zero_grad(set_to_none=True)
                     scaler.scale(loss).backward()
-                    # Gradient clipping across all trainable params (backbone block + head).
-                    # Passing model.parameters() is fine — frozen params have no
-                    # gradients so clip_grad_norm_ is a no-op for them.
                     scaler.unscale_(optimizer)
                     nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     scaler.step(optimizer)
@@ -381,11 +280,7 @@ class ViewClassifier:
         return total_loss / len(loader)
 
     def _evaluate(self, loader: DataLoader, criterion: nn.Module) -> tuple[float, float, float]:
-        """Return (mean_loss, accuracy, balanced_accuracy) without gradient tracking.
-
-        Balanced accuracy = mean per-class recall.  A model predicting only the
-        majority class scores 50%, not 68%, so it cannot win early stopping.
-        """
+        """Return (mean_loss, accuracy, balanced_accuracy)."""
         total_loss = 0.0
         all_preds: list[int] = []
         all_labels: list[int] = []
@@ -426,14 +321,20 @@ class ViewClassifier:
         """Predict 0 (wide) or 1 (close-up) for a single frame."""
         return self.predict_batch([frame])[0]
 
-    def predict_batch(self, frames: list[np.ndarray]) -> list[int]:
-        """Predict labels for a list of frames in a single forward pass."""
+    def predict_batch(self, frames: list[np.ndarray], batch_size: int = 256) -> list[int]:
+        """Predict labels for a list of frames, processing in chunks."""
         self.model.eval()
-        x = torch.stack([_preprocess_frame(f) for f in frames]).to(self.device)
-        with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
-                logits = self.model(x)
-        return torch.argmax(logits, dim=1).cpu().tolist()
+        all_preds: list[int] = []
+
+        for start in range(0, len(frames), batch_size):
+            chunk = frames[start : start + batch_size]
+            x = torch.stack([_preprocess_frame(f) for f in chunk]).to(self.device)
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
+                    logits = self.model(x)
+            all_preds.extend(torch.argmax(logits, dim=1).cpu().tolist())
+
+        return all_preds
 
     # ── Persistence ───────────────────────────────────────────────────────────
 

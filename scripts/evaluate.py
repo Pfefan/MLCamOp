@@ -6,31 +6,27 @@ import numpy as np
 import yaml
 from sklearn.metrics import classification_report, confusion_matrix
 
-from src.data.sampler import generate_training_data
+from src.data.sampler import generate_training_data, concert_split, split_dataset
 from src.models.view_classifier import ViewClassifier
 from src.utils.logger import setup_logger
 
 
 def evaluate(config: dict) -> None:
-    """
-    Load the trained model, run inference on a random 20% held-out split,
-    and print a full classification report with confusion matrix.
-
-    Uses the same cached frame data as training — no video re-read needed.
-    Supports multiple concerts defined under data.concerts in the config.
-    """
+    """Run the trained model on the held-out validation split and print a report."""
     logger = setup_logger(config["logging"]["log_file"])
 
-    concerts      = config["data"]["concerts"]
-    sample_fps    = config["data"].get("sample_fps", 1.0)
-    threshold     = config["data"].get("similarity_threshold", 65.9)
-    cache_dir     = config["data"].get("cache_dir", "data/cache")
+    concerts   = config["data"]["concerts"]
+    sample_fps = config["data"].get("sample_fps", 1.0)
+    cache_dir  = config["data"].get("cache_dir", "data/cache")
+    val_split  = config["training"].get("val_split", 0.2)
 
-    logger.info("Loading evaluation frames (from cache if available)...")
+    logger.info("Loading frames (from cache if available)...")
 
-    all_frames: list = []
-    all_labels: list = []
+    concerts_frames: list[list] = []
+    concerts_labels: list[list] = []
     for concert in concerts:
+        threshold = concert.get("similarity_threshold",
+                                config["data"].get("similarity_threshold", 39))
         frames, labels = generate_training_data(
             total_view_path      = concert["total_view"],
             closeup_path         = concert["closeup"],
@@ -39,44 +35,63 @@ def evaluate(config: dict) -> None:
             similarity_threshold = threshold,
             cache_dir            = cache_dir,
         )
-        all_frames.extend(frames)
-        all_labels.extend(labels)
+        concerts_frames.append(frames)
+        concerts_labels.append(labels)
 
-    if not all_frames:
+    if not any(concerts_frames):
         logger.error("No frames loaded. Check video paths.")
         return
 
-    # Use the last 20% as the test split (matches the shuffled train split
-    # which uses a fixed seed=42, so these frames were not seen during training)
-    split       = int(len(all_frames) * 0.8)
-    test_frames = all_frames[split:]
-    test_labels = all_labels[split:]
+    if len(concerts) >= 2:
+        _, _, val_frames, val_labels = concert_split(
+            concerts_frames, concerts_labels, val_concert_idx=-1
+        )
+        logger.info(
+            "Evaluating on concert %d (%d frames) — held out during training.",
+            len(concerts), len(val_frames),
+        )
+    else:
+        all_frames = concerts_frames[0]
+        all_labels = concerts_labels[0]
+        _, _, val_frames, val_labels = split_dataset(
+            all_frames, all_labels, val_split=val_split
+        )
+        logger.info("Evaluating on %d held-out frames...", len(val_frames))
 
     logger.info("Loading model from %s...", config["model"]["checkpoint"])
     classifier = ViewClassifier()
     classifier.load(config["model"]["checkpoint"])
 
-    logger.info("Running inference on %d test frames...", len(test_frames))
-    predictions = classifier.predict_batch(test_frames)
+    predictions = classifier.predict_batch(val_frames)
 
-    print("\n" + "=" * 50)
+    labels_arr = np.array(val_labels)
+    preds_arr  = np.array(predictions)
+
+    print("\n" + "=" * 60)
     print("EVALUATION RESULTS")
-    print("=" * 50)
+    print("=" * 60)
     print(classification_report(
-        test_labels,
-        predictions,
+        labels_arr,
+        preds_arr,
         target_names=["wide (0)", "close-up (1)"],
         zero_division=0,
     ))
 
-    cm = confusion_matrix(test_labels, predictions)
+    cm = confusion_matrix(labels_arr, preds_arr)
     print("Confusion Matrix:")
-    print("  Predicted wide | Predicted close-up")
-    print(f"  True wide:      {cm[0][0]:4d}  |  {cm[0][1]:4d}")
-    print(f"  True close-up:  {cm[1][0]:4d}  |  {cm[1][1]:4d}")
+    print("                    Predicted wide  Predicted close-up")
+    print(f"  True wide:              {cm[0][0]:4d}              {cm[0][1]:4d}")
+    print(f"  True close-up:          {cm[1][0]:4d}              {cm[1][1]:4d}")
 
-    acc = np.mean(np.array(predictions) == np.array(test_labels))
-    logger.info("Test accuracy: %.1f%%", acc * 100)
+    acc     = np.mean(preds_arr == labels_arr)
+    w_rec   = cm[0][0] / cm[0].sum() if cm[0].sum() > 0 else 0.0
+    c_rec   = cm[1][1] / cm[1].sum() if cm[1].sum() > 0 else 0.0
+    bal_acc = (w_rec + c_rec) / 2
+    print(f"\nAccuracy:          {acc     * 100:.1f}%")
+    print(f"Balanced accuracy: {bal_acc  * 100:.1f}%")
+    print(f"Wide recall:       {w_rec    * 100:.1f}%")
+    print(f"Close-up recall:   {c_rec    * 100:.1f}%")
+    logger.info("Balanced accuracy: %.1f%%", bal_acc * 100)
 
 
 if __name__ == "__main__":

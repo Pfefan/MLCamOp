@@ -1,35 +1,33 @@
 """Train the ViewClassifier on concert video data."""
 
 import argparse
+import gc
 
 import yaml
 
-from src.data.sampler import generate_training_data
+from src.data.sampler import generate_training_data, concert_split, split_dataset
 from src.models.view_classifier import ViewClassifier
 from src.utils.logger import setup_logger
 
 
 def train_model(config: dict) -> None:
-    """
-    Full training pipeline:
-      1. Sample frames from each concert's total_view + closeup + result (cached).
-      2. Concatenate all concerts into one dataset.
-      3. Train with class-balanced loss, augmentation, AMP, early stopping.
-      4. Save best checkpoint to disk.
-    """
+    """Load concert data, split train/val, train ViewClassifier, save checkpoint."""
     logger = setup_logger(config["logging"]["log_file"])
 
-    concerts   = config["data"]["concerts"]
-    sample_fps = config["data"].get("sample_fps", 1.0)
-    threshold  = config["data"].get("similarity_threshold", 65.9)
-    cache_dir  = config["data"].get("cache_dir", "data/cache")
+    concerts      = config["data"]["concerts"]
+    sample_fps    = config["data"].get("sample_fps", 1.0)
+    cache_dir     = config["data"].get("cache_dir", "data/cache")
     force_rebuild = config["data"].get("force_rebuild", False)
+    val_split     = config["training"].get("val_split", 0.2)
 
-    all_frames: list = []
-    all_labels: list = []
+    # Collect frames per concert (kept separate for concert-level splitting)
+    concerts_frames: list[list] = []
+    concerts_labels: list[list] = []
 
     for i, concert in enumerate(concerts, start=1):
-        logger.info("Concert %d/%d — loading frames...", i, len(concerts))
+        threshold = concert.get("similarity_threshold",
+                                config["data"].get("similarity_threshold", 39))
+        logger.info("Concert %d/%d — loading frames (threshold=%s)...", i, len(concerts), threshold)
         logger.info("  total_view : %s", concert["total_view"])
         logger.info("  closeup    : %s", concert["closeup"])
         logger.info("  result     : %s", concert["result"])
@@ -43,29 +41,53 @@ def train_model(config: dict) -> None:
             cache_dir            = cache_dir,
             force_rebuild        = force_rebuild,
         )
-        all_frames.extend(frames)
-        all_labels.extend(labels)
+        concerts_frames.append(frames)
+        concerts_labels.append(labels)
 
-    if not all_frames:
+    total_frames = sum(len(f) for f in concerts_frames)
+    if total_frames == 0:
         logger.error("No frames sampled. Check video paths in configs/model_config.yaml.")
         return
 
+    logger.info("Total dataset: %d frames from %d concert(s).", total_frames, len(concerts))
+
+    if len(concerts) >= 2:
+        logger.info(
+            "Using concert-level split: training on concerts 1–%d, validating on concert %d.",
+            len(concerts) - 1, len(concerts),
+        )
+        train_frames, train_labels, val_frames, val_labels = concert_split(
+            concerts_frames, concerts_labels, val_concert_idx=-1
+        )
+    else:
+        logger.info("Single concert: using shuffled 80/20 frame-level split.")
+        all_frames = concerts_frames[0]
+        all_labels = concerts_labels[0]
+        train_frames, train_labels, val_frames, val_labels = split_dataset(
+            all_frames, all_labels, val_split=val_split
+        )
+
+    # Free per-concert lists — train/val now hold the only references we need.
+    del concerts_frames, concerts_labels
+    gc.collect()
+
     logger.info(
-        "Total training data: %d frames from %d concert(s).",
-        len(all_frames), len(concerts),
+        "Split: %d train frames / %d val frames",
+        len(train_frames), len(val_frames),
     )
 
     classifier = ViewClassifier()
     logger.info("Using device: %s", classifier.device)
 
     classifier.train(
-        frames     = all_frames,
-        labels     = all_labels,
-        epochs     = config["training"]["epochs"],
-        batch_size = config["training"]["batch_size"],
-        lr         = config["training"]["learning_rate"],
-        val_split  = config["training"].get("val_split", 0.2),
-        patience   = config["training"].get("patience", 10),
+        train_frames = train_frames,
+        train_labels = train_labels,
+        val_frames   = val_frames,
+        val_labels   = val_labels,
+        epochs       = config["training"]["epochs"],
+        batch_size   = config["training"]["batch_size"],
+        lr           = config["training"]["learning_rate"],
+        patience     = config["training"].get("patience", 15),
     )
 
     save_path = config["model"]["checkpoint"]

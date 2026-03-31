@@ -1,10 +1,4 @@
-"""
-Pipeline stage: run ViewClassifier inference over a video stream.
-
-Feeds frames from ``total_view`` through the trained model and returns a
-per-frame label sequence (0 = wide, 1 = close-up) that the editing stage
-uses to decide which source to pull from at each moment.
-"""
+"""Run ViewClassifier inference over a video stream."""
 
 import cv2
 import numpy as np
@@ -17,23 +11,7 @@ def classify_video(
     classifier:      ViewClassifier,
     sample_fps:      float = 1.0,
 ) -> list[tuple[float, int]]:
-    """
-    Run the classifier over a video and return (timestamp_sec, label) pairs.
-
-    Seeks directly to each sample point rather than reading every frame so it
-    stays fast even on 7 GB files.
-
-    Args:
-        total_view_path: Path to the wide-shot video.
-        classifier:      Trained ``ViewClassifier`` instance.
-        sample_fps:      How many frames per second to classify.
-
-    Returns:
-        List of ``(timestamp_seconds, label)`` — label is 0 (wide) or 1 (close-up).
-
-    Raises:
-        ValueError: If the video cannot be opened.
-    """
+    """Run the classifier on sampled frames, return (timestamp, label) pairs."""
     cap = cv2.VideoCapture(total_view_path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {total_view_path}")

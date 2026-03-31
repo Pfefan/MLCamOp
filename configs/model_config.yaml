@@ -12,16 +12,28 @@
 # ─────────────────────────────────────────────────────────────────────────────
 data:
   concerts:
-    - total_view: "E:/Job/Projekte/CutStudio/03_StadtorchesterJan2026/input/TOTALLE.mp4"
-      closeup:    "E:/Job/Projekte/CutStudio/03_StadtorchesterJan2026/input/CLOSEUP.mp4"
-      result:     "E:/Job/Projekte/CutStudio/03_StadtorchesterJan2026/input/SCHNITT.mp4"
-    # Add future concerts here, e.g.:
-    # - total_view: "E:/Job/Projekte/CutStudio/04_SomeConcert/input/TOTALLE.mp4"
-    #   closeup:    "E:/Job/Projekte/CutStudio/04_SomeConcert/input/CLOSEUP.mp4"
-    #   result:     "E:/Job/Projekte/CutStudio/04_SomeConcert/input/SCHNITT.mp4"
+    - total_view:          "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/totalle_StadtkapelleWeiz_20251116_00004162.mp4"
+      closeup:             "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/closeup_StadtkapelleWeiz_20251116_00004162.mp4"
+      result:              "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/schnitt_StadtkapelleWeiz_20251116_00000000.mp4"
+      similarity_threshold: 30.8
 
-  sample_fps:           2.0
-  similarity_threshold: 39
+    - total_view:          "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/totalle.mp4"
+      closeup:             "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/rec.mp4"
+      result:              "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/closeup.mp4"
+      similarity_threshold: 43.7
+
+    - total_view:          "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/TOTALLE_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
+      closeup:             "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/CLOSEUP_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
+      result:              "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/SCHNITT_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
+      similarity_threshold: 25.1
+
+    # Add future concerts here, e.g.:
+    # - total_view:          "E:/Job/Projekte/CutStudio/05_SomeConcert/TOTALLE.mp4"
+    #   closeup:             "E:/Job/Projekte/CutStudio/05_SomeConcert/CLOSEUP.mp4"
+    #   result:              "E:/Job/Projekte/CutStudio/05_SomeConcert/SCHNITT.mp4"
+    #   similarity_threshold: 39  # TODO: run tune_threshold.py --concert N
+
+  sample_fps: 2.0
 
   # Preprocessed frame cache — avoids re-reading 3×7 GB on every run.
   # Each concert gets its own cache file keyed by its paths + settings.

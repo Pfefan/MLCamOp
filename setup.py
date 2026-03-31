@@ -6,8 +6,8 @@ setup(
     name="concert-video-editor",
     version="0.1.0",
     author="Stefan",
-    description="ML project for editing concert videos by combining total and close-up views.",
-    packages=find_packages(),  # finds 'src' and all sub-packages: src.data, src.models etc.
+    description="ML-based concert video editor: auto-cut between wide and close-up cameras.",
+    packages=find_packages(),
     python_requires=">=3.11",
     install_requires=[
         "numpy",
@@ -15,9 +15,10 @@ setup(
         "scikit-learn",
         "torch",
         "torchvision",
-        "moviepy",
-        "pandas",
-        "matplotlib",
         "PyYAML",
+        "tqdm",
     ],
+    extras_require={
+        "dev": ["pytest", "jupyter", "ipykernel", "matplotlib"],
+    },
 )

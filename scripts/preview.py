@@ -1,31 +1,16 @@
-"""
-Preview script: produce a fully cut output video from a SINGLE input video.
+"""Preview: produce a cut video from a single wide-shot using the trained model.
 
-This is the "does it work?" sanity check.  You give it only the wide-shot
-(total_view) video — no real close-up camera required.  A digital zoom
-(centre-crop + upscale) is applied to simulate a close-up camera, and the
-trained model decides frame-by-frame which source to show.
+A digital zoom simulates the close-up camera unless a real close-up is provided.
 
 Usage::
 
-    python311 scripts/preview.py --config configs/model_config.yaml \\
-        --input  "E:/concerts/show.mp4" \\
+    python scripts/preview.py --config configs/model_config.yaml \\
+        --input "path/to/total_view.mp4" --output "output/preview.mp4"
+
+    # With a real close-up camera:
+    python scripts/preview.py --config configs/model_config.yaml \\
+        --input "path/to/total_view.mp4" --closeup "path/to/closeup.mp4" \\
         --output "output/preview.mp4"
-
-    # Optionally override the crop factor (default 0.5 = 50% of the frame area):
-    python311 scripts/preview.py --config configs/model_config.yaml \\
-        --input  "E:/concerts/show.mp4" \\
-        --output "output/preview.mp4" \\
-        --crop   0.4
-
-    # Or provide a real close-up camera feed if you have one:
-    python311 scripts/preview.py --config configs/model_config.yaml \\
-        --input   "E:/concerts/total_view.mp4" \\
-        --closeup "E:/concerts/closeup.mp4" \\
-        --output  "output/preview.mp4"
-
-The output is a standard MP4 at the source resolution and FPS, ready to open
-in any video player.
 """
 
 import argparse
@@ -56,16 +41,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _read_all_frames(path: str, desc: str) -> tuple[list[np.ndarray], float]:
-    """
-    Read every frame from *path* into memory and return (frames, fps).
-
-    This is only called on videos that are already cropped / labelled — i.e.
-    the output of this script is at most a few minutes long in practice.  For
-    the full ~65-minute source videos, use seek-based access instead.
-
-    Raises:
-        ValueError: If the video cannot be opened.
-    """
+    """Read every frame from *path* into memory and return (frames, fps)."""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {path}")
@@ -92,24 +68,7 @@ def _read_frames_at_timestamps(
     fps:        float,
     desc:       str,
 ) -> list[np.ndarray]:
-    """
-    Seek-based frame reader: extract exactly the frames at *timestamps* (seconds).
-
-    Used to pull matching frames from a second video (e.g. the real close-up)
-    at the same sample points that were classified.
-
-    Args:
-        path:       Video file path.
-        timestamps: List of timestamps in seconds.
-        fps:        Video FPS (used to convert timestamps to frame indices).
-        desc:       tqdm progress bar label.
-
-    Returns:
-        List of BGR frames, same length as *timestamps*.
-
-    Raises:
-        ValueError: If the video cannot be opened.
-    """
+    """Seek-based frame reader: extract frames at the given timestamps (seconds)."""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {path}")
@@ -132,20 +91,7 @@ def _read_frames_at_timestamps(
 
 
 def _simulate_closeup(frame: np.ndarray, crop_factor: float) -> np.ndarray:
-    """
-    Produce a simulated close-up by centre-cropping then upscaling.
-
-    A *crop_factor* of 0.5 means the crop covers the central 50 % of both
-    width and height, then upscales back to the original resolution.
-    This mimics a 2× digital zoom on a single camera feed.
-
-    Args:
-        frame:       Full-resolution BGR frame.
-        crop_factor: Fraction of each dimension to keep (0.0 < crop_factor < 1.0).
-
-    Returns:
-        Simulated close-up at the same resolution as *frame*.
-    """
+    """Centre-crop then upscale to simulate a close-up (digital zoom)."""
     h, w = frame.shape[:2]
     crop_h = int(h * crop_factor)
     crop_w = int(w * crop_factor)
@@ -171,18 +117,7 @@ def run_preview(
     closeup_path:    str | None = None,
     min_shot_sec:    float      = 0.5,
 ) -> None:
-    """
-    Classify, assemble, and render a preview cut from a single wide-shot video.
-
-    Args:
-        total_view_path: Path to the wide-shot source video.
-        output_path:     Where to write the output MP4.
-        checkpoint:      Path to the trained ``ViewClassifier`` weights.
-        sample_fps:      How many frames per second to classify (matches training).
-        crop_factor:     Digital-zoom crop fraction (ignored if *closeup_path* given).
-        closeup_path:    Optional real close-up video.  If None, digital zoom is used.
-        min_shot_sec:    Minimum cut length in seconds (suppresses flicker).
-    """
+    """Classify, assemble, and render a preview cut from a wide-shot video."""
     # ── 1. Load model ────────────────────────────────────────────────────────
     print(f"Loading model from {checkpoint} ...")
     classifier = ViewClassifier()
