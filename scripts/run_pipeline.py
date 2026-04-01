@@ -63,13 +63,17 @@ def run_pipeline(config: dict, output_path: str, concert_index: int = 0) -> None
     closeup_path    = concert["closeup"]
     checkpoint      = config["model"]["checkpoint"]
     sample_fps      = config["data"].get("sample_fps", 1.0)
+    dual_frame      = config["data"].get("dual_frame", False)
 
     logger.info("Loading model from %s", checkpoint)
-    classifier = ViewClassifier()
+    classifier = ViewClassifier(dual_frame=dual_frame)
     classifier.load(checkpoint)
 
     logger.info("Classifying shots in %s ...", total_view_path)
-    predictions = classify_video(total_view_path, classifier, sample_fps=sample_fps)
+    predictions = classify_video(
+        total_view_path, classifier, sample_fps=sample_fps,
+        closeup_path=closeup_path if dual_frame else None,
+    )
     logger.info("Classified %d sample points", len(predictions))
 
     timestamps = [ts    for ts, _     in predictions]

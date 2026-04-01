@@ -18,6 +18,7 @@ def train_model(config: dict) -> None:
     sample_fps    = config["data"].get("sample_fps", 1.0)
     cache_dir     = config["data"].get("cache_dir", "data/cache")
     force_rebuild = config["data"].get("force_rebuild", False)
+    dual_frame    = config["data"].get("dual_frame", False)
     val_split     = config["training"].get("val_split", 0.2)
 
     # Collect frames per concert (kept separate for concert-level splitting)
@@ -40,6 +41,7 @@ def train_model(config: dict) -> None:
             similarity_threshold = threshold,
             cache_dir            = cache_dir,
             force_rebuild        = force_rebuild,
+            dual_frame           = dual_frame,
         )
         concerts_frames.append(frames)
         concerts_labels.append(labels)
@@ -51,7 +53,9 @@ def train_model(config: dict) -> None:
 
     logger.info("Total dataset: %d frames from %d concert(s).", total_frames, len(concerts))
 
-    if len(concerts) >= 2:
+    force_random = config.get("_force_random_split", False)
+
+    if len(concerts) >= 2 and not force_random:
         logger.info(
             "Using concert-level split: training on concerts 1–%d, validating on concert %d.",
             len(concerts) - 1, len(concerts),
@@ -60,9 +64,12 @@ def train_model(config: dict) -> None:
             concerts_frames, concerts_labels, val_concert_idx=-1
         )
     else:
-        logger.info("Single concert: using shuffled 80/20 frame-level split.")
-        all_frames = concerts_frames[0]
-        all_labels = concerts_labels[0]
+        if force_random:
+            logger.info("Using random frame-level split (--random-split diagnostic mode).")
+        else:
+            logger.info("Single concert: using shuffled 80/20 frame-level split.")
+        all_frames = [f for cf in concerts_frames for f in cf]
+        all_labels = [l for cl in concerts_labels for l in cl]
         train_frames, train_labels, val_frames, val_labels = split_dataset(
             all_frames, all_labels, val_split=val_split
         )
@@ -76,7 +83,7 @@ def train_model(config: dict) -> None:
         len(train_frames), len(val_frames),
     )
 
-    classifier = ViewClassifier()
+    classifier = ViewClassifier(dual_frame=dual_frame)
     logger.info("Using device: %s", classifier.device)
 
     classifier.train(
@@ -99,10 +106,18 @@ def train_model(config: dict) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train the ViewClassifier.")
     parser.add_argument("--config", default="configs/model_config.yaml")
+    parser.add_argument(
+        "--random-split", action="store_true",
+        help="Use random 80/20 frame-level split instead of concert-level. "
+             "Diagnostic only — tests if the task is learnable at all.",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
+
+    if args.random_split:
+        cfg["_force_random_split"] = True
 
     train_model(cfg)
 

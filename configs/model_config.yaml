@@ -15,17 +15,17 @@ data:
     - total_view:          "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/totalle_StadtkapelleWeiz_20251116_00004162.mp4"
       closeup:             "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/closeup_StadtkapelleWeiz_20251116_00004162.mp4"
       result:              "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/schnitt_StadtkapelleWeiz_20251116_00000000.mp4"
-      similarity_threshold: 30.8
+      similarity_threshold: 31.1
 
     - total_view:          "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/totalle.mp4"
-      closeup:             "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/rec.mp4"
-      result:              "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/closeup.mp4"
-      similarity_threshold: 43.7
+      closeup:             "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/closeup.mp4"
+      result:              "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/rec.mp4"
+      similarity_threshold: 42.5
 
     - total_view:          "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/TOTALLE_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
       closeup:             "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/CLOSEUP_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
       result:              "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/SCHNITT_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
-      similarity_threshold: 25.1
+      similarity_threshold: 25.4
 
     # Add future concerts here, e.g.:
     # - total_view:          "E:/Job/Projekte/CutStudio/05_SomeConcert/TOTALLE.mp4"
@@ -34,6 +34,9 @@ data:
     #   similarity_threshold: 39  # TODO: run tune_threshold.py --concert N
 
   sample_fps: 2.0
+
+  # Feed both cameras as separate 224x224 inputs (6-channel: wide RGB + closeup RGB).
+  dual_frame: true
 
   # Preprocessed frame cache — avoids re-reading 3×7 GB on every run.
   # Each concert gets its own cache file keyed by its paths + settings.
@@ -44,9 +47,9 @@ data:
 # Training hyperparameters
 # ─────────────────────────────────────────────────────────────────────────────
 training:
-  epochs:        40
-  batch_size:    32          # smaller batches = more gradient updates per epoch
-  learning_rate: 0.0003      # classification head only; backbone is fully frozen
+  epochs:        60
+  batch_size:    64          # larger batches = more stable gradients
+  learning_rate: 0.0005      # head LR; backbone gets lr/10 and lr/100
   val_split:     0.2
   patience:      15
 

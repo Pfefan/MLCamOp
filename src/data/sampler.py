@@ -130,16 +130,21 @@ def generate_training_data(
     similarity_threshold: float = 65.9,
     cache_dir:            str   = "data/cache",
     force_rebuild:        bool  = False,
+    dual_frame:           bool  = False,
 ) -> tuple[list[np.ndarray], list[int]]:
     """Generate (frame, label) pairs from three synchronised concert videos.
 
-    Frames are from total_view (224x224). Labels from comparing result to both cameras.
+    When dual_frame=False (default): frames are from total_view only (224x224).
+    When dual_frame=True: frames are wide+closeup side-by-side (224x224, 112px each).
+    Labels come from comparing result to both cameras.
     Results are cached to disk keyed by paths + settings.
     """
     # ── Cache lookup ────────────────────────────────────────────────────────
     os.makedirs(cache_dir, exist_ok=True)
+    # Include dual_frame in key so single/dual caches don't collide
+    key_suffix = "_dual" if dual_frame else ""
     key        = _cache_key(total_view_path, closeup_path, result_path,
-                            sample_fps, similarity_threshold)
+                            sample_fps, similarity_threshold) + key_suffix
     cache_path = Path(cache_dir) / f"frames_{key}.pt"
 
     if not force_rebuild and cache_path.exists():
@@ -169,8 +174,9 @@ def generate_training_data(
     sample_indices = list(range(0, total_frames, frame_interval))
 
     logger.info(
-        "Video FPS: %.1f | Every %d-th frame | %d sample points",
+        "Video FPS: %.1f | Every %d-th frame | %d sample points%s",
         video_fps, frame_interval, len(sample_indices),
+        " (dual-frame)" if dual_frame else "",
     )
 
     frames:  list[np.ndarray] = []
@@ -198,13 +204,22 @@ def generate_training_data(
         closeup_match = diff_to_closeup < similarity_threshold
 
         if wide_match and not closeup_match:
-            frames.append(cv2.resize(f_total, _STORE_SIZE))
-            labels.append(0)
+            label = 0
         elif closeup_match and not wide_match:
-            frames.append(cv2.resize(f_total, _STORE_SIZE))
-            labels.append(1)
+            label = 1
         else:
             skipped += 1
+            continue
+
+        if dual_frame:
+            # 6-channel: each camera gets full 224×224 resolution
+            wide_resized  = cv2.resize(f_total,   _STORE_SIZE)
+            close_resized = cv2.resize(f_closeup, _STORE_SIZE)
+            frames.append(np.concatenate([wide_resized, close_resized], axis=2))
+        else:
+            frames.append(cv2.resize(f_total, _STORE_SIZE))
+
+        labels.append(label)
 
     cap_total.release()
     cap_closeup.release()

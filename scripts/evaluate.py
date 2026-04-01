@@ -18,6 +18,7 @@ def evaluate(config: dict) -> None:
     concerts   = config["data"]["concerts"]
     sample_fps = config["data"].get("sample_fps", 1.0)
     cache_dir  = config["data"].get("cache_dir", "data/cache")
+    dual_frame = config["data"].get("dual_frame", False)
     val_split  = config["training"].get("val_split", 0.2)
 
     logger.info("Loading frames (from cache if available)...")
@@ -34,6 +35,7 @@ def evaluate(config: dict) -> None:
             sample_fps           = sample_fps,
             similarity_threshold = threshold,
             cache_dir            = cache_dir,
+            dual_frame           = dual_frame,
         )
         concerts_frames.append(frames)
         concerts_labels.append(labels)
@@ -59,7 +61,7 @@ def evaluate(config: dict) -> None:
         logger.info("Evaluating on %d held-out frames...", len(val_frames))
 
     logger.info("Loading model from %s...", config["model"]["checkpoint"])
-    classifier = ViewClassifier()
+    classifier = ViewClassifier(dual_frame=dual_frame)
     classifier.load(config["model"]["checkpoint"])
 
     predictions = classifier.predict_batch(val_frames)

@@ -38,9 +38,11 @@ _NUM_WORKERS = 4
 # Augmentation pipeline applied only during training
 _AUGMENT = T.Compose([
     T.RandomHorizontalFlip(p=0.5),
-    T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
-    T.RandomAffine(degrees=5, translate=(0.05, 0.05)),
-    T.RandomGrayscale(p=0.05),         # simulate monochrome camera footage
+    T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1),
+    T.RandomAffine(degrees=8, translate=(0.08, 0.08), scale=(0.9, 1.1)),
+    T.RandomGrayscale(p=0.1),
+    T.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5)),
+    T.RandomErasing(p=0.2, scale=(0.02, 0.15)),
 ])
 
 
@@ -49,33 +51,69 @@ _AUGMENT = T.Compose([
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _preprocess_frame(frame: np.ndarray) -> torch.Tensor:
-    """Convert a BGR uint8 frame to a normalised CHW float tensor."""
+    """Convert a BGR uint8 frame to a normalised CHW float tensor.
+
+    Handles both 3-channel (single camera) and 6-channel (dual camera) frames.
+    For 6-channel, each 3-channel half is independently normalised.
+    """
     resized = cv2.resize(frame, _INPUT_SIZE)
-    rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-    tensor  = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-    return (tensor - _IMAGENET_MEAN) / _IMAGENET_STD
+    if resized.ndim == 3 and resized.shape[2] == 6:
+        # Dual-frame: channels 0-2 = wide BGR, 3-5 = closeup BGR
+        wide_rgb   = cv2.cvtColor(resized[:, :, :3], cv2.COLOR_BGR2RGB)
+        close_rgb  = cv2.cvtColor(resized[:, :, 3:], cv2.COLOR_BGR2RGB)
+        wide_t     = torch.from_numpy(wide_rgb).permute(2, 0, 1).float() / 255.0
+        close_t    = torch.from_numpy(close_rgb).permute(2, 0, 1).float() / 255.0
+        wide_t     = (wide_t  - _IMAGENET_MEAN) / _IMAGENET_STD
+        close_t    = (close_t - _IMAGENET_MEAN) / _IMAGENET_STD
+        return torch.cat([wide_t, close_t], dim=0)  # shape: (6, 224, 224)
+    else:
+        rgb    = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+        return (tensor - _IMAGENET_MEAN) / _IMAGENET_STD
 
 
-def _build_mobilenet(num_classes: int) -> nn.Module:
-    """Load pretrained MobileNetV3-Small, freeze all but last two feature blocks."""
+def _build_mobilenet(num_classes: int, in_channels: int = 3) -> nn.Module:
+    """Load pretrained MobileNetV3-Small, freeze all but last three feature blocks.
+
+    When in_channels=6 (dual-frame), the first conv layer is expanded by
+    duplicating the pretrained 3-channel weights, giving the model a warm start
+    on both camera inputs.
+    """
     model = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1)
+
+    # Expand first conv from 3 to 6 input channels if needed
+    if in_channels != 3:
+        old_conv = model.features[0][0]
+        new_conv = nn.Conv2d(
+            in_channels, old_conv.out_channels,
+            kernel_size=old_conv.kernel_size, stride=old_conv.stride,
+            padding=old_conv.padding, bias=old_conv.bias is not None,
+        )
+        with torch.no_grad():
+            # Duplicate pretrained 3-ch weights for the extra channels
+            repeats = (in_channels + 2) // 3  # ceil division
+            new_conv.weight.copy_(
+                old_conv.weight.repeat(1, repeats, 1, 1)[:, :in_channels]
+            )
+            if old_conv.bias is not None:
+                new_conv.bias.copy_(old_conv.bias)
+        model.features[0][0] = new_conv
 
     # Freeze the entire backbone first
     for param in model.features.parameters():
         param.requires_grad = False
 
-    # Unfreeze the last two feature blocks for domain adaptation
-    for param in model.features[-1].parameters():
-        param.requires_grad = True
-    for param in model.features[-2].parameters():
-        param.requires_grad = True
+    # Unfreeze the last three feature blocks for domain adaptation
+    for block in model.features[-3:]:
+        for param in block.parameters():
+            param.requires_grad = True
 
     # Replace the final linear with a two-layer head
     in_features = model.classifier[-1].in_features
     model.classifier[-1] = nn.Sequential(
         nn.Linear(in_features, 128),
         nn.Hardswish(),
-        nn.Dropout(p=0.4),
+        nn.Dropout(p=0.5),
         nn.Linear(128, num_classes),
     )
     return model
@@ -133,10 +171,12 @@ class ViewClassifier:
     Wraps MobileNetV3-Small pretrained on ImageNet, fine-tuned on concert data.
     """
 
-    def __init__(self, num_classes: int = 2):
+    def __init__(self, num_classes: int = 2, dual_frame: bool = False):
         self.num_classes = num_classes
+        self.dual_frame  = dual_frame
         self.device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model       = _build_mobilenet(num_classes).to(self.device)
+        in_channels      = 6 if dual_frame else 3
+        self.model       = _build_mobilenet(num_classes, in_channels=in_channels).to(self.device)
         self.is_trained  = False
 
     # ── Training ──────────────────────────────────────────────────────────────
@@ -169,13 +209,17 @@ class ViewClassifier:
 
         y_train = torch.tensor(train_labels, dtype=torch.long)
         class_weights = _make_class_weights(y_train, self.device)
-        criterion     = nn.CrossEntropyLoss(weight=class_weights)
+        criterion     = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
 
         # Differential learning rates — three tiers:
-        #   features[-2]: lr/100 — very slow updates to earlier pretrained block
-        #   features[-1]: lr/10  — moderate updates to final conv block
+        #   features[-3]: lr/100 — very slow updates to earlier pretrained block
+        #   features[-2]: lr/10  — moderate updates
+        #   features[-1]: lr/5   — faster updates to final conv block
         #   classifier head: lr  — full speed for randomly-initialised head
-        backbone_params_deep   = [
+        backbone_params_deep = [
+            p for p in self.model.features[-3].parameters() if p.requires_grad
+        ]
+        backbone_params_mid = [
             p for p in self.model.features[-2].parameters() if p.requires_grad
         ]
         backbone_params_top = [
@@ -185,7 +229,8 @@ class ViewClassifier:
         optimizer = torch.optim.AdamW(
             [
                 {"params": backbone_params_deep, "lr": lr / 100},
-                {"params": backbone_params_top,  "lr": lr / 10},
+                {"params": backbone_params_mid,  "lr": lr / 10},
+                {"params": backbone_params_top,  "lr": lr / 5},
                 {"params": head_params,          "lr": lr},
             ],
             weight_decay=1e-3,
@@ -201,13 +246,15 @@ class ViewClassifier:
         scaler  = GradScaler("cuda", enabled=use_amp)
 
         n_deep = sum(p.numel() for p in backbone_params_deep)
+        n_mid  = sum(p.numel() for p in backbone_params_mid)
         n_top  = sum(p.numel() for p in backbone_params_top)
         n_head = sum(p.numel() for p in head_params)
         counts = torch.bincount(y_train)
         print(f"Training on {len(train_frames)} | Validating on {len(val_frames)}")
-        print(f"Trainable parameters: {n_deep + n_top + n_head:,}  "
-              f"(features[-2]: {n_deep:,} @ lr/100 | "
-              f"features[-1]: {n_top:,} @ lr/10 | "
+        print(f"Trainable parameters: {n_deep + n_mid + n_top + n_head:,}  "
+              f"(features[-3]: {n_deep:,} @ lr/100 | "
+              f"features[-2]: {n_mid:,} @ lr/10 | "
+              f"features[-1]: {n_top:,} @ lr/5 | "
               f"head: {n_head:,} @ lr)")
         print(f"Train class counts — wide: {counts[0].item()}  close-up: {counts[1].item()}")
         print(f"Class weights — wide: {class_weights[0]:.3f}  close-up: {class_weights[1]:.3f}")
@@ -343,12 +390,34 @@ class ViewClassifier:
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        torch.save(self.model.state_dict(), path)
+        torch.save(
+            {"state_dict": self.model.state_dict(), "dual_frame": self.dual_frame},
+            path,
+        )
         print(f"Model saved to {path}")
 
     def load(self, path: str) -> None:
-        """Load model weights from disk (safe weights-only mode)."""
-        state = torch.load(path, map_location=self.device, weights_only=True)
+        """Load model weights from disk.
+
+        Automatically detects dual_frame from checkpoint and rebuilds
+        the architecture if needed.
+        """
+        data = torch.load(path, map_location=self.device, weights_only=False)
+
+        # Support both old (bare state_dict) and new (dict with metadata) formats
+        if isinstance(data, dict) and "state_dict" in data:
+            state      = data["state_dict"]
+            dual_frame = data.get("dual_frame", False)
+        else:
+            state      = data
+            dual_frame = False
+
+        # Rebuild model if dual_frame flag doesn't match
+        if dual_frame != self.dual_frame:
+            self.dual_frame = dual_frame
+            in_channels     = 6 if dual_frame else 3
+            self.model      = _build_mobilenet(self.num_classes, in_channels=in_channels).to(self.device)
+
         self.model.load_state_dict(state)
         self.is_trained = True
         print(f"Model loaded from {path}")

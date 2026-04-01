@@ -17,6 +17,11 @@ class TestPreprocessFrame(unittest.TestCase):
         tensor = _preprocess_frame(frame)
         self.assertTrue(tensor.dtype.is_floating_point)
 
+    def test_dual_frame_output_shape(self):
+        frame = np.random.randint(0, 255, (224, 224, 6), dtype=np.uint8)
+        tensor = _preprocess_frame(frame)
+        self.assertEqual(tensor.shape, (6, 224, 224))
+
 
 class TestFrameDataset(unittest.TestCase):
 
@@ -56,6 +61,12 @@ class TestViewClassifier(unittest.TestCase):
         self.assertEqual(len(preds), 5)
         for p in preds:
             self.assertIn(p, (0, 1))
+
+    def test_dual_frame_predict(self):
+        classifier = ViewClassifier(dual_frame=True)
+        frame = np.random.randint(0, 255, (224, 224, 6), dtype=np.uint8)
+        pred = classifier.predict(frame)
+        self.assertIn(pred, (0, 1))
 
 
 if __name__ == "__main__":
