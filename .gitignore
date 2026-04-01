@@ -222,3 +222,4 @@ models/*.pt
 
 # custom
 *.pt
+.vscode/
