@@ -3,10 +3,12 @@
 import argparse
 import gc
 
+import numpy as np
+import torch
 import yaml
 
 from src.data.sampler import generate_training_data, concert_split, split_dataset
-from src.models.view_classifier import ViewClassifier
+from src.models.view_classifier import ViewClassifier, _NUM_WORKERS
 from src.utils.logger import setup_logger
 
 
@@ -18,8 +20,13 @@ def train_model(config: dict) -> None:
     sample_fps    = config["data"].get("sample_fps", 1.0)
     cache_dir     = config["data"].get("cache_dir", "data/cache")
     force_rebuild = config["data"].get("force_rebuild", False)
-    dual_frame    = config["data"].get("dual_frame", False)
     val_split     = config["training"].get("val_split", 0.2)
+    low_memory    = config["training"].get("low_memory", False)
+    num_workers   = 0 if low_memory else config["training"].get("num_workers", _NUM_WORKERS)
+    batch_size    = config["training"]["batch_size"]
+    if low_memory:
+        batch_size = max(16, batch_size // 2)
+        logger.info("low_memory mode: workers=0, batch_size=%d", batch_size)
 
     # Collect frames per concert (kept separate for concert-level splitting)
     concerts_frames: list[list] = []
@@ -41,7 +48,7 @@ def train_model(config: dict) -> None:
             similarity_threshold = threshold,
             cache_dir            = cache_dir,
             force_rebuild        = force_rebuild,
-            dual_frame           = dual_frame,
+            dual_frame           = True,
         )
         concerts_frames.append(frames)
         concerts_labels.append(labels)
@@ -68,7 +75,7 @@ def train_model(config: dict) -> None:
             logger.info("Using random frame-level split (--random-split diagnostic mode).")
         else:
             logger.info("Single concert: using shuffled 80/20 frame-level split.")
-        all_frames = [f for cf in concerts_frames for f in cf]
+        all_frames = np.concatenate(concerts_frames)
         all_labels = [l for cl in concerts_labels for l in cl]
         train_frames, train_labels, val_frames, val_labels = split_dataset(
             all_frames, all_labels, val_split=val_split
@@ -83,7 +90,7 @@ def train_model(config: dict) -> None:
         len(train_frames), len(val_frames),
     )
 
-    classifier = ViewClassifier(dual_frame=dual_frame)
+    classifier = ViewClassifier()
     logger.info("Using device: %s", classifier.device)
 
     classifier.train(
@@ -92,9 +99,10 @@ def train_model(config: dict) -> None:
         val_frames   = val_frames,
         val_labels   = val_labels,
         epochs       = config["training"]["epochs"],
-        batch_size   = config["training"]["batch_size"],
+        batch_size   = batch_size,
         lr           = config["training"]["learning_rate"],
         patience     = config["training"].get("patience", 15),
+        num_workers  = num_workers,
     )
 
     save_path = config["model"]["checkpoint"]
@@ -118,6 +126,12 @@ if __name__ == "__main__":
 
     if args.random_split:
         cfg["_force_random_split"] = True
+
+    # Allow TF32 on Ampere+ GPUs — ~2× faster matmuls with negligible precision loss
+    torch.set_float32_matmul_precision("high")
+    # cuDNN auto-tuner: finds fastest conv algorithm for the fixed input size.
+    # ~10s overhead on first batch, then faster for all subsequent batches.
+    torch.backends.cudnn.benchmark = True
 
     train_model(cfg)
 

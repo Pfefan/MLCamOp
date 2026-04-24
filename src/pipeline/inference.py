@@ -14,7 +14,8 @@ def classify_video(
 ) -> list[tuple[float, int]]:
     """Run the classifier on sampled frames, return (timestamp, label) pairs.
 
-    If closeup_path is provided, feeds both cameras side-by-side (dual-frame mode).
+    If closeup_path is provided, feeds both cameras as 6-channel dual frames.
+    All frames are collected first so predict_batch() has full temporal context.
     """
     cap_total = cv2.VideoCapture(total_view_path)
     if not cap_total.isOpened():
@@ -30,7 +31,8 @@ def classify_video(
     total_frames = int(cap_total.get(cv2.CAP_PROP_FRAME_COUNT))
     step         = max(1, int(video_fps / sample_fps))
 
-    results: list[tuple[float, int]] = []
+    all_frames:     list[np.ndarray] = []
+    all_timestamps: list[float]      = []
 
     for idx in range(0, total_frames, step):
         cap_total.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -50,11 +52,16 @@ def classify_video(
         else:
             frame = f_total
 
-        label     = classifier.predict(frame)
-        timestamp = idx / video_fps
-        results.append((timestamp, label))
+        all_frames.append(frame)
+        all_timestamps.append(idx / video_fps)
 
     cap_total.release()
     if cap_closeup is not None:
         cap_closeup.release()
-    return results
+
+    if not all_frames:
+        return []
+
+    # predict_batch receives the full sequence so temporal windows are correct
+    predictions = classifier.predict_batch(np.stack(all_frames))
+    return list(zip(all_timestamps, predictions))

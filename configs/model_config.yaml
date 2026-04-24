@@ -33,13 +33,15 @@ data:
     #   result:              "E:/Job/Projekte/CutStudio/05_SomeConcert/SCHNITT.mp4"
     #   similarity_threshold: 39  # TODO: run tune_threshold.py --concert N
 
+  # Frames per second to sample from video.
+  # This is the single biggest RAM knob — halving it halves dataset size:
+  #   2.0 fps × 3 concerts ≈ 19 GB  (requires ~24 GB free RAM)
+  #   1.0 fps × 3 concerts ≈  9 GB  (fits on 12 GB free RAM)
+  #   0.5 fps × 3 concerts ≈  5 GB  (fits on 8 GB free RAM)
+  # Changing this invalidates the cache and forces a full re-sample.
   sample_fps: 2.0
 
-  # Feed both cameras as separate 224x224 inputs (6-channel: wide RGB + closeup RGB).
-  dual_frame: true
-
-  # Preprocessed frame cache — avoids re-reading 3×7 GB on every run.
-  # Each concert gets its own cache file keyed by its paths + settings.
+  # Preprocessed frame cache — avoids re-reading videos on every run.
   cache_dir:    "data/cache"
   force_rebuild: false
 
@@ -48,10 +50,19 @@ data:
 # ─────────────────────────────────────────────────────────────────────────────
 training:
   epochs:        60
-  batch_size:    64          # larger batches = more stable gradients
+  batch_size:    128
   learning_rate: 0.0005      # head LR; backbone gets lr/10 and lr/100
   val_split:     0.2
-  patience:      15
+  patience:      8
+
+  # RAM tuning:
+  #   num_workers: 2    default — forked workers share frame data via COW.
+  #                     Set to 0 to disable forking entirely (slower training,
+  #                     but no forked copies of the frame buffer).
+  #   low_memory: true  overrides num_workers to 0 AND halves batch_size.
+  #                     Use on systems with < 16 GB free RAM.
+  num_workers: 4
+  low_memory:  false
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model

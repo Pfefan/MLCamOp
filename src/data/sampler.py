@@ -130,12 +130,12 @@ def generate_training_data(
     similarity_threshold: float = 65.9,
     cache_dir:            str   = "data/cache",
     force_rebuild:        bool  = False,
-    dual_frame:           bool  = False,
+    dual_frame:           bool  = True,
 ) -> tuple[list[np.ndarray], list[int]]:
     """Generate (frame, label) pairs from three synchronised concert videos.
 
-    When dual_frame=False (default): frames are from total_view only (224x224).
-    When dual_frame=True: frames are wide+closeup side-by-side (224x224, 112px each).
+    Frames are wide+closeup stacked as 6-channel (224×224×6) when dual_frame=True
+    (default), or total_view only (224×224×3) when dual_frame=False.
     Labels come from comparing result to both cameras.
     Results are cached to disk keyed by paths + settings.
     """
@@ -149,14 +149,23 @@ def generate_training_data(
 
     if not force_rebuild and cache_path.exists():
         logger.info("Loading cached training data from %s", cache_path)
-        data = torch.load(str(cache_path), weights_only=False)
+        # mmap=True: only pages accessed are loaded from disk — the full
+        # cache file is NOT read into RAM upfront.  Saves ~19 GB of initial
+        # allocation when loading; the OS will page in frames on demand.
+        try:
+            data = torch.load(str(cache_path), weights_only=False, mmap=True)
+        except TypeError:
+            # mmap kwarg requires PyTorch >= 2.0; fall back gracefully
+            data = torch.load(str(cache_path), weights_only=False)
 
-        # Support both old (list-of-tensors) and new (stacked tensor) cache formats
+        # Support both old (list-of-tensors) and new (stacked tensor) formats.
+        # Always return a single contiguous ndarray (N, H, W, C) — NOT a
+        # list — so _FrameDataset is COW-safe across DataLoader workers.
         raw = data["frames"]
         if isinstance(raw, list):
-            frames = [f.numpy() for f in raw]
+            frames = np.stack([f.numpy() for f in raw])
         else:
-            frames = list(raw.numpy())
+            frames = np.ascontiguousarray(raw.numpy())
 
         labels = data["labels"].tolist()
         del data, raw
@@ -245,7 +254,7 @@ def generate_training_data(
     logger.info("Cached %d labelled frames to %s", len(frames), cache_path)
 
     _print_label_summary(labels)
-    return frames, labels
+    return np.stack(frames), labels
 
 
 def _print_label_summary(labels: list[int]) -> None:
@@ -260,11 +269,11 @@ def _print_label_summary(labels: list[int]) -> None:
 
 
 def split_dataset(
-    frames:    list[np.ndarray],
+    frames:    np.ndarray,
     labels:    list[int],
     val_split: float = 0.2,
     seed:      int   = 42,
-) -> tuple[list[np.ndarray], list[int], list[np.ndarray], list[int]]:
+) -> tuple[np.ndarray, list[int], np.ndarray, list[int]]:
     """Shuffle and split frames/labels into train/val sets."""
     n       = len(frames)
     rng     = np.random.default_rng(seed)
@@ -274,19 +283,19 @@ def split_dataset(
     train_idx    = indices[:split]
     val_idx      = indices[split:]
 
-    train_frames = [frames[i] for i in train_idx]
+    train_frames = frames[train_idx]
     train_labels = [labels[i] for i in train_idx]
-    val_frames   = [frames[i] for i in val_idx]
+    val_frames   = frames[val_idx]
     val_labels   = [labels[i] for i in val_idx]
 
     return train_frames, train_labels, val_frames, val_labels
 
 
 def concert_split(
-    concerts_frames: list[list[np.ndarray]],
+    concerts_frames: list[np.ndarray],
     concerts_labels: list[list[int]],
     val_concert_idx: int = -1,
-) -> tuple[list[np.ndarray], list[int], list[np.ndarray], list[int]]:
+) -> tuple[np.ndarray, list[int], np.ndarray, list[int]]:
     """Split by concert: train on all except one, validate on the held-out one."""
     n = len(concerts_frames)
     if n < 2:
@@ -297,12 +306,8 @@ def concert_split(
 
     idx = val_concert_idx % n   # support negative indexing
 
-    train_frames: list[np.ndarray] = []
-    train_labels: list[int]        = []
-    for i in range(n):
-        if i != idx:
-            train_frames.extend(concerts_frames[i])
-            train_labels.extend(concerts_labels[i])
+    train_frames = np.concatenate([concerts_frames[i] for i in range(n) if i != idx])
+    train_labels = [l for i in range(n) if i != idx for l in concerts_labels[i]]
 
     val_frames = concerts_frames[idx]
     val_labels = concerts_labels[idx]
