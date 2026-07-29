@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
@@ -56,13 +57,65 @@ _COLOR_AUGMENT = T.Compose([
     T.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5)),
 ])
 
+# Extra, harder degradation applied ONLY to the close-up half.
+#
+# The close-up input pixels are the same footage the human editor cut into the
+# result, from which the pseudo-labels are derived.  With few concerts this
+# invites a shortcut: the model can latch onto the close-up's pixel/upscale
+# signature ("this exact clip was selected") instead of learning editorial cues.
+# Labels are computed once in sampler.py from clean pixels and cached, so
+# degrading the close-up INPUT here cannot corrupt the target — it only breaks
+# the input↔label pixel identity and forces content-based features.
+_CLOSEUP_EXTRA_BLUR = T.GaussianBlur(kernel_size=7, sigma=(0.5, 3.0))
+
+
+def _degrade_closeup(view: torch.Tensor) -> torch.Tensor:
+    """Aggressively degrade a single (3, H, W) uint8 close-up view.
+
+    Attacks the exact shortcut keys the model could exploit:
+    - resolution loss (down→up resample) destroys the upscale/codec signature,
+    - additive Gaussian noise breaks pixel-level identity with the labelled clip,
+    - extra blur removes high-frequency fingerprints.
+
+    Operates in uint8 pixel space (normalisation is deferred to the GPU), and is
+    applied stochastically so the model still occasionally sees near-clean
+    close-ups (matching the clean inference-time distribution).
+    """
+    _, h, w = view.shape
+    # Resolution degradation: shrink then upscale back, masking the signature.
+    if torch.rand(1).item() < 0.7:
+        scale = 0.35 + 0.40 * torch.rand(1).item()   # r ∈ [0.35, 0.75]
+        f     = view.float().unsqueeze(0)
+        small = F.interpolate(
+            f, scale_factor=scale,
+            mode="bilinear", align_corners=False, recompute_scale_factor=False,
+        )
+        f     = F.interpolate(small, size=(h, w), mode="bilinear", align_corners=False)
+        view  = f.squeeze(0).round().clamp_(0, 255).to(torch.uint8)
+
+    # Extra blur on top of the shared color pipeline.
+    if torch.rand(1).item() < 0.5:
+        view = _CLOSEUP_EXTRA_BLUR(view)
+
+    # Additive noise in uint8 pixel space (≈ up to 12 grey levels).
+    if torch.rand(1).item() < 0.6:
+        sigma = 12.0 * torch.rand(1).item()
+        noise = torch.randn(view.shape) * sigma
+        view  = (view.float() + noise).round().clamp_(0, 255).to(torch.uint8)
+
+    return view
+
 
 def _augment_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    """Apply augmentation to a 3-ch, 6-ch, or K*6-ch normalised tensor.
+    """Apply augmentation to a 3-ch, 6-ch, or K*6-ch uint8 tensor.
 
-    Spatial transforms are applied identically across all channels (so all
-    frames in the temporal window are flipped/affined consistently).  Color
-    transforms are applied independently to each 3-channel camera view.
+    Runs in uint8 pixel space (the conventional domain for these torchvision
+    transforms); ImageNet normalisation happens later on the GPU.  Spatial
+    transforms are applied identically across all channels (so all frames in the
+    temporal window are flipped/affined consistently).  Color transforms are
+    applied independently to each 3-channel camera view, and the close-up half
+    receives extra, harder degradation to break the input↔label pixel identity
+    (see _degrade_closeup).
     """
     n_ch = tensor.shape[0]
     if n_ch % 6 == 0:
@@ -71,8 +124,10 @@ def _augment_tensor(tensor: torch.Tensor) -> torch.Tensor:
         K = n_ch // 6
         parts: list[torch.Tensor] = []
         for k in range(K):
-            parts.append(_COLOR_AUGMENT(tensor[k * 6     : k * 6 + 3]))
-            parts.append(_COLOR_AUGMENT(tensor[k * 6 + 3 : k * 6 + 6]))
+            wide  = _COLOR_AUGMENT(tensor[k * 6     : k * 6 + 3])
+            close = _degrade_closeup(_COLOR_AUGMENT(tensor[k * 6 + 3 : k * 6 + 6]))
+            parts.append(wide)
+            parts.append(close)
         return torch.cat(parts, dim=0)
     # 3-ch single-camera fallback
     return _SPATIAL_AUGMENT(_COLOR_AUGMENT(tensor))
@@ -88,7 +143,13 @@ def _preprocess_frame(frame: np.ndarray) -> torch.Tensor:
     Handles both 3-channel (single camera) and 6-channel (dual camera) frames.
     For 6-channel, each 3-channel half is independently normalised.
     """
-    resized = cv2.resize(frame, _INPUT_SIZE)
+    # Frames are already stored at _INPUT_SIZE by the sampler/inference paths, so
+    # skip the resize in that (hot) case — it runs K× per sample every epoch.
+    # Only resize defensively when a caller passes a differently-sized frame.
+    if frame.shape[1] != _INPUT_SIZE[0] or frame.shape[0] != _INPUT_SIZE[1]:
+        resized = cv2.resize(frame, _INPUT_SIZE)
+    else:
+        resized = frame
     if resized.ndim == 3 and resized.shape[2] == 6:
         # Dual-frame: channels 0-2 = wide BGR, 3-5 = closeup BGR
         wide_rgb   = cv2.cvtColor(resized[:, :, :3], cv2.COLOR_BGR2RGB)
@@ -102,6 +163,40 @@ def _preprocess_frame(frame: np.ndarray) -> torch.Tensor:
         rgb    = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
         return (tensor - _IMAGENET_MEAN) / _IMAGENET_STD
+
+
+def _frame_to_uint8_chw(frame: np.ndarray) -> torch.Tensor:
+    """Convert a BGR uint8 frame to an RGB uint8 CHW tensor (no normalisation).
+
+    Normalisation is deferred to the GPU (see _normalize_windows) so that only
+    1-byte-per-channel data crosses the CPU→GPU boundary — 4× less PCIe traffic
+    than transferring pre-normalised float32, and the per-frame float/normalise
+    work moves off the DataLoader workers onto the GPU.
+    """
+    if frame.shape[1] != _INPUT_SIZE[0] or frame.shape[0] != _INPUT_SIZE[1]:
+        frame = cv2.resize(frame, _INPUT_SIZE)
+    if frame.ndim == 3 and frame.shape[2] == 6:
+        order = [2, 1, 0, 5, 4, 3]   # BGR|BGR → RGB|RGB
+    else:
+        order = [2, 1, 0]            # BGR → RGB
+    rgb = np.ascontiguousarray(frame[..., order])
+    return torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
+
+
+def _normalize_windows(x: torch.Tensor) -> torch.Tensor:
+    """uint8 (B, C, H, W) RGB → ImageNet-normalised float in channels_last.
+
+    C is a multiple of 3; the 3-channel ImageNet mean/std are tiled across all
+    camera views / temporal frames.  Runs on whatever device x already lives on
+    (the GPU during training/inference), moving the float+normalise cost off the
+    CPU DataLoader workers.  Returns channels_last so the conv backbone (#2) gets
+    its preferred memory layout.
+    """
+    c    = x.shape[1]
+    mean = _IMAGENET_MEAN.to(x.device).repeat(c // 3, 1, 1)
+    std  = _IMAGENET_STD.to(x.device).repeat(c // 3, 1, 1)
+    x    = x.float().div_(255.0).sub_(mean).div_(std)
+    return x.contiguous(memory_format=torch.channels_last)
 
 
 def _build_mobilenet(num_classes: int) -> nn.Module:
@@ -174,6 +269,9 @@ class _DualStreamModel(nn.Module):
 
     def _extract(self, x: torch.Tensor) -> torch.Tensor:
         """Run 3-channel input through shared backbone → feature vector."""
+        # Narrowing the channel dim of a channels_last window drops the layout;
+        # restore it so the conv backbone runs in its fast path (#2).
+        x = x.contiguous(memory_format=torch.channels_last)
         x = self.features(x)
         x = self.avgpool(x)
         return x.flatten(1)
@@ -238,12 +336,15 @@ class _FrameDataset(torch.utils.data.Dataset):
         return tensor, self.labels[idx]
 
     def _build_window(self, idx: int) -> torch.Tensor:
-        """Return K preprocessed frames centred on *idx* as a (K*6, H, W) tensor."""
+        """Return K frames centred on *idx* as a (K*6, H, W) uint8 tensor.
+
+        Kept as uint8 — normalisation is deferred to the GPU (_normalize_windows).
+        """
         n    = len(self.frames)
         K    = _TEMPORAL_WINDOW
         half = K // 2
         indices = [max(0, min(n - 1, idx + i - half)) for i in range(K)]
-        return torch.cat([_preprocess_frame(self.frames[j]) for j in indices], dim=0)
+        return torch.cat([_frame_to_uint8_chw(self.frames[j]) for j in indices], dim=0)
 
 
 def _make_class_weights(labels: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -274,7 +375,13 @@ class ViewClassifier:
         self.num_classes = num_classes
         self.dual_frame  = dual_frame
         self.device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model       = self._make_model().to(self.device)
+        # channels_last (#2): conv backbones run faster in NHWC under AMP.
+        self.model       = self._make_model().to(
+            self.device, memory_format=torch.channels_last
+        )
+        # Forward handle — replaced by a torch.compile wrapper in train() when on
+        # CUDA.  Kept separate so self.model stays eager (clean state_dict keys).
+        self._model_fwd  = self.model
         self.is_trained  = False
 
     def _make_model(self) -> nn.Module:
@@ -315,6 +422,17 @@ class ViewClassifier:
             num_workers=num_workers, pin_memory=pin,
             persistent_workers=num_workers > 0,
         )
+
+        # torch.compile (#2): fuse kernels for a CUDA speedup.  Wrap a SEPARATE
+        # handle so self.model stays an eager module (clean state_dict keys for
+        # save/load).  Skipped on CPU and disablable via MLCAMOP_NO_COMPILE=1.
+        self._model_fwd = self.model
+        if self.device.type == "cuda" and os.environ.get("MLCAMOP_NO_COMPILE") != "1":
+            try:
+                self._model_fwd = torch.compile(self.model)
+                print("torch.compile: enabled")
+            except Exception as exc:  # pragma: no cover - depends on backend
+                print(f"torch.compile unavailable ({exc}); running eager")
 
         y_train = torch.tensor(train_labels, dtype=torch.long)
         class_weights = _make_class_weights(y_train, self.device)
@@ -429,11 +547,13 @@ class ViewClassifier:
 
         with torch.set_grad_enabled(training):
             for batch_x, batch_y in loader:
+                # uint8 window → GPU (4× smaller transfer) → normalise on GPU (#1).
                 batch_x = batch_x.to(self.device, non_blocking=True)
                 batch_y = batch_y.to(self.device, non_blocking=True)
+                batch_x = _normalize_windows(batch_x)
 
                 with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
-                    outputs = self.model(batch_x)
+                    outputs = self._model_fwd(batch_x)
                     loss    = criterion(outputs, batch_y)
 
                 if training:
@@ -459,8 +579,9 @@ class ViewClassifier:
             for batch_x, batch_y in loader:
                 batch_x = batch_x.to(self.device, non_blocking=True)
                 batch_y = batch_y.to(self.device, non_blocking=True)
+                batch_x = _normalize_windows(batch_x)
                 with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
-                    outputs    = self.model(batch_x)
+                    outputs    = self._model_fwd(batch_x)
                     total_loss += criterion(outputs, batch_y).item()
                 preds = torch.argmax(outputs, dim=1)
                 all_preds.extend(preds.cpu().tolist())
@@ -515,11 +636,12 @@ class ViewClassifier:
             windows = []
             for idx in range(start, end):
                 indices = [max(0, min(n - 1, idx + i - half)) for i in range(K)]
-                windows.append(torch.cat([_preprocess_frame(frames[j]) for j in indices], dim=0))
+                windows.append(torch.cat([_frame_to_uint8_chw(frames[j]) for j in indices], dim=0))
             x = torch.stack(windows).to(self.device, non_blocking=True)
+            x = _normalize_windows(x)
             with torch.no_grad():
                 with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
-                    logits = self.model(x)
+                    logits = getattr(self, "_model_fwd", self.model)(x)
             all_preds.extend(torch.argmax(logits, dim=1).cpu().tolist())
 
         return all_preds
@@ -556,7 +678,10 @@ class ViewClassifier:
         # Rebuild model if dual_frame flag doesn't match
         if dual_frame != self.dual_frame:
             self.dual_frame = dual_frame
-            self.model      = self._make_model().to(self.device)
+            self.model      = self._make_model().to(
+                self.device, memory_format=torch.channels_last
+            )
+            self._model_fwd = self.model
 
         self.model.load_state_dict(state)
         self.is_trained = True

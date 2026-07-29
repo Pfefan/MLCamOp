@@ -46,7 +46,7 @@ def _read_frames_at_timestamps(
 
 def run_pipeline(config: dict, output_path: str, concert_index: int = 0) -> None:
     """Load model, classify frames, assemble cut, and render the output video."""
-    logger = setup_logger(config["logging"]["log_file"])
+    logger = setup_logger(config["logging"]["log_file"], config["logging"].get("level", "INFO"))
 
     concerts = config["data"]["concerts"]
     if concert_index >= len(concerts):
@@ -63,11 +63,12 @@ def run_pipeline(config: dict, output_path: str, concert_index: int = 0) -> None
     closeup_path    = concert["closeup"]
     checkpoint      = config["model"]["checkpoint"]
     sample_fps      = config["data"].get("sample_fps", 1.0)
-    dual_frame      = config["data"].get("dual_frame", False)
+    dual_frame      = config["data"].get("dual_frame", True)
 
     logger.info("Loading model from %s", checkpoint)
     classifier = ViewClassifier(dual_frame=dual_frame)
     classifier.load(checkpoint)
+    dual_frame = classifier.dual_frame
 
     logger.info("Classifying shots in %s ...", total_view_path)
     predictions = classify_video(

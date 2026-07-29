@@ -14,23 +14,19 @@ from src.utils.logger import setup_logger
 
 def train_model(config: dict) -> None:
     """Load concert data, split train/val, train ViewClassifier, save checkpoint."""
-    logger = setup_logger(config["logging"]["log_file"])
+    logger = setup_logger(config["logging"]["log_file"], config["logging"].get("level", "INFO"))
 
     concerts      = config["data"]["concerts"]
     sample_fps    = config["data"].get("sample_fps", 1.0)
     cache_dir     = config["data"].get("cache_dir", "data/cache")
     force_rebuild = config["data"].get("force_rebuild", False)
+    dual_frame    = config["data"].get("dual_frame", True)
     val_split     = config["training"].get("val_split", 0.2)
-    low_memory    = config["training"].get("low_memory", False)
-    num_workers   = 0 if low_memory else config["training"].get("num_workers", _NUM_WORKERS)
+    num_workers   = config["training"].get("num_workers", _NUM_WORKERS)
     batch_size    = config["training"]["batch_size"]
-    if low_memory:
-        batch_size = max(16, batch_size // 2)
-        logger.info("low_memory mode: workers=0, batch_size=%d", batch_size)
 
-    # Collect frames per concert (kept separate for concert-level splitting)
-    concerts_frames: list[list] = []
-    concerts_labels: list[list] = []
+    concerts_frames: list[np.ndarray] = []
+    concerts_labels: list[list[int]]  = []
 
     for i, concert in enumerate(concerts, start=1):
         threshold = concert.get("similarity_threshold",
@@ -48,7 +44,7 @@ def train_model(config: dict) -> None:
             similarity_threshold = threshold,
             cache_dir            = cache_dir,
             force_rebuild        = force_rebuild,
-            dual_frame           = True,
+            dual_frame           = dual_frame,
         )
         concerts_frames.append(frames)
         concerts_labels.append(labels)
@@ -90,7 +86,10 @@ def train_model(config: dict) -> None:
         len(train_frames), len(val_frames),
     )
 
-    classifier = ViewClassifier()
+    classifier = ViewClassifier(
+        num_classes = config["model"].get("num_classes", 2),
+        dual_frame  = dual_frame,
+    )
     logger.info("Using device: %s", classifier.device)
 
     classifier.train(

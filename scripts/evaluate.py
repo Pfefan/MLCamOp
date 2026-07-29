@@ -13,7 +13,7 @@ from src.utils.logger import setup_logger
 
 def evaluate(config: dict) -> None:
     """Run the trained model on the held-out validation split and print a report."""
-    logger = setup_logger(config["logging"]["log_file"])
+    logger = setup_logger(config["logging"]["log_file"], config["logging"].get("level", "INFO"))
 
     concerts   = config["data"]["concerts"]
     sample_fps = config["data"].get("sample_fps", 1.0)
@@ -22,8 +22,8 @@ def evaluate(config: dict) -> None:
 
     logger.info("Loading frames (from cache if available)...")
 
-    concerts_frames: list[list] = []
-    concerts_labels: list[list] = []
+    concerts_frames: list[np.ndarray] = []
+    concerts_labels: list[list[int]]  = []
     for concert in concerts:
         threshold = concert.get("similarity_threshold",
                                 config["data"].get("similarity_threshold", 39))

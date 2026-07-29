@@ -10,7 +10,7 @@ def assemble_cut(
     min_shot_frames:   int = 10,
 ) -> list[np.ndarray]:
     """Select wide (label=0) or close-up (label=1) frame at each position."""
-    if len(total_view_frames) != len(close_up_frames) != len(labels):
+    if not (len(total_view_frames) == len(close_up_frames) == len(labels)):
         raise ValueError(
             "total_view_frames, close_up_frames, and labels must all be the same length."
         )
@@ -22,7 +22,6 @@ def assemble_cut(
         result.append(total_view_frames[i] if label == 0 else close_up_frames[i])
 
     return result
-
 
 
 # ── Private helpers ───────────────────────────────────────────────────────────
@@ -39,9 +38,7 @@ def _enforce_min_shot_length(labels: list[int], min_frames: int) -> list[int]:
         run_end = i + 1
         while run_end < len(smoothed) and smoothed[run_end] == current:
             run_end += 1
-        run_length = run_end - i
-        if run_length < min_frames and i > 0:
-            # Replace this short run with the previous label
+        if run_end - i < min_frames and i > 0:
             prev_label = smoothed[i - 1]
             for j in range(i, run_end):
                 smoothed[j] = prev_label

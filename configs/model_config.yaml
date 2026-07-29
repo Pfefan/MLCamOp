@@ -45,6 +45,9 @@ data:
   cache_dir:    "data/cache"
   force_rebuild: false
 
+  # Stack wide + close-up as a 6-channel dual frame. Must match the checkpoint.
+  dual_frame: true
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Training hyperparameters
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,14 +58,7 @@ training:
   val_split:     0.2
   patience:      8
 
-  # RAM tuning:
-  #   num_workers: 2    default — forked workers share frame data via COW.
-  #                     Set to 0 to disable forking entirely (slower training,
-  #                     but no forked copies of the frame buffer).
-  #   low_memory: true  overrides num_workers to 0 AND halves batch_size.
-  #                     Use on systems with < 16 GB free RAM.
   num_workers: 4
-  low_memory:  false
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model

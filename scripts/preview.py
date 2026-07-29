@@ -118,14 +118,20 @@ def run_preview(
     min_shot_sec:    float      = 0.5,
 ) -> None:
     """Classify, assemble, and render a preview cut from a wide-shot video."""
-    # ── 1. Load model ────────────────────────────────────────────────────────
     print(f"Loading model from {checkpoint} ...")
     classifier = ViewClassifier()
     classifier.load(checkpoint)
 
-    # ── 2. Classify the wide-shot video ──────────────────────────────────────
+    if classifier.dual_frame and closeup_path is None:
+        raise ValueError(
+            "Checkpoint is a dual-frame model and needs a real close-up feed. "
+            "Pass --closeup; the simulated digital zoom cannot be classified."
+        )
+
     print(f"Classifying shots in {total_view_path} ...")
-    predictions = classify_video(total_view_path, classifier, sample_fps=sample_fps)
+    predictions = classify_video(
+        total_view_path, classifier, sample_fps=sample_fps, closeup_path=closeup_path,
+    )
 
     timestamps = [ts    for ts, _     in predictions]
     labels     = [label for _,  label in predictions]
@@ -138,12 +144,10 @@ def run_preview(
         f"close-up: {n_closeup} ({n_closeup / len(labels) * 100:.1f}%)"
     )
 
-    # ── 3. Get the video FPS so we can resolve timestamps → frame indices ─────
     cap = cv2.VideoCapture(total_view_path)
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     cap.release()
 
-    # ── 4. Load source frames at the classified timestamps ───────────────────
     print("Reading total-view frames ...")
     total_frames = _read_frames_at_timestamps(
         total_view_path, timestamps, video_fps, desc="  total_view"
@@ -163,18 +167,12 @@ def run_preview(
         )
         closeup_frames = [_simulate_closeup(f, crop_factor) for f in iterable]
 
-    # ── 5. Assemble the cut ───────────────────────────────────────────────────
-    # Convert min_shot_sec to frames using sample_fps (labels are at sample_fps)
     min_shot_frames = max(1, int(min_shot_sec * sample_fps))
     print(f"Assembling cut (min shot = {min_shot_sec}s = {min_shot_frames} samples) ...")
     output_frames = assemble_cut(total_frames, closeup_frames, labels, min_shot_frames)
 
-    # ── 6. Render to disk ─────────────────────────────────────────────────────
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     print(f"Rendering {len(output_frames)} frames to {output_path} ...")
-
-    # The assembled frames are at sample_fps (sparse).  Write them at sample_fps
-    # so timing is correct — each output frame represents 1/sample_fps seconds.
     render_video(output_frames, output_path, fps=sample_fps)
     print(f"Done.  Output written to: {output_path}")
 

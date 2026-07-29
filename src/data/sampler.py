@@ -131,7 +131,7 @@ def generate_training_data(
     cache_dir:            str   = "data/cache",
     force_rebuild:        bool  = False,
     dual_frame:           bool  = True,
-) -> tuple[list[np.ndarray], list[int]]:
+) -> tuple[np.ndarray, list[int]]:
     """Generate (frame, label) pairs from three synchronised concert videos.
 
     Frames are wide+closeup stacked as 6-channel (224×224×6) when dual_frame=True
@@ -163,14 +163,14 @@ def generate_training_data(
         # list — so _FrameDataset is COW-safe across DataLoader workers.
         raw = data["frames"]
         if isinstance(raw, list):
-            frames = np.stack([f.numpy() for f in raw])
+            cached_frames = np.stack([f.numpy() for f in raw])
         else:
-            frames = np.ascontiguousarray(raw.numpy())
+            cached_frames = np.ascontiguousarray(raw.numpy())
 
         labels = data["labels"].tolist()
         del data, raw
         _print_label_summary(labels)
-        return frames, labels
+        return cached_frames, labels
 
     # ── Video reading ────────────────────────────────────────────────────────
     cap_total   = _open_video(total_view_path)
