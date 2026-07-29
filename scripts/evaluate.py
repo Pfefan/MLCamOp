@@ -9,6 +9,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 from src.data.sampler import generate_training_data, concert_split, split_dataset
 from src.models.view_classifier import ViewClassifier
 from src.utils.logger import setup_logger
+from src.utils.metrics import cut_event_prf
 
 
 def evaluate(config: dict) -> None:
@@ -18,52 +19,55 @@ def evaluate(config: dict) -> None:
     concerts   = config["data"]["concerts"]
     sample_fps = config["data"].get("sample_fps", 1.0)
     cache_dir  = config["data"].get("cache_dir", "data/cache")
+    dual_frame = config["data"].get("dual_frame", True)
+    labeling   = config["data"].get("labeling", {})
+    audio_cfg  = config["data"].get("audio", {})
     val_split  = config["training"].get("val_split", 0.2)
 
     logger.info("Loading frames (from cache if available)...")
 
-    concerts_frames: list[np.ndarray] = []
-    concerts_labels: list[list[int]]  = []
+    concert_sets: list = []
     for concert in concerts:
         threshold = concert.get("similarity_threshold",
                                 config["data"].get("similarity_threshold", 39))
-        frames, labels = generate_training_data(
+        concert_sets.append(generate_training_data(
             total_view_path      = concert["total_view"],
             closeup_path         = concert["closeup"],
             result_path          = concert["result"],
             sample_fps           = sample_fps,
             similarity_threshold = threshold,
             cache_dir            = cache_dir,
-            dual_frame           = True,
-        )
-        concerts_frames.append(frames)
-        concerts_labels.append(labels)
+            dual_frame           = dual_frame,
+            keep_transitions     = labeling.get("keep_transitions", True),
+            transition_weight    = labeling.get("transition_weight", 0.3),
+            audio_enabled        = audio_cfg.get("enabled", False),
+            audio_sample_rate    = audio_cfg.get("sample_rate", 16000),
+            audio_n_mels         = audio_cfg.get("n_mels", 32),
+        ))
 
-    if not any(len(f) > 0 for f in concerts_frames):
+    if not any(len(s) > 0 for s in concert_sets):
         logger.error("No frames loaded. Check video paths.")
         return
 
     if len(concerts) >= 2:
-        _, _, val_frames, val_labels = concert_split(
-            concerts_frames, concerts_labels, val_concert_idx=-1
-        )
+        _, val_data = concert_split(concert_sets, val_concert_idx=-1)
+        ordered = True
         logger.info(
             "Evaluating on concert %d (%d frames) — held out during training.",
-            len(concerts), len(val_frames),
+            len(concerts), len(val_data),
         )
     else:
-        all_frames = concerts_frames[0]
-        all_labels = concerts_labels[0]
-        _, _, val_frames, val_labels = split_dataset(
-            all_frames, all_labels, val_split=val_split
-        )
-        logger.info("Evaluating on %d held-out frames...", len(val_frames))
+        _, val_data = split_dataset(concert_sets[0], val_split=val_split)
+        ordered = False
+        logger.info("Evaluating on %d held-out frames...", len(val_data))
+
+    val_frames, val_labels = val_data.frames, val_data.labels
 
     logger.info("Loading model from %s...", config["model"]["checkpoint"])
     classifier = ViewClassifier()
     classifier.load(config["model"]["checkpoint"])
 
-    predictions = classifier.predict_batch(val_frames)
+    predictions = classifier.predict_batch(val_frames, audio=val_data.audio)
 
     labels_arr = np.array(val_labels)
     preds_arr  = np.array(predictions)
@@ -93,6 +97,20 @@ def evaluate(config: dict) -> None:
     print(f"Wide recall:       {w_rec    * 100:.1f}%")
     print(f"Close-up recall:   {c_rec    * 100:.1f}%")
     logger.info("Balanced accuracy: %.1f%%", bal_acc * 100)
+
+    # Event-based cut metrics need the frames in temporal order; the shuffled
+    # single-concert split breaks that, so only report them on the ordered path.
+    if ordered:
+        sample_fps    = config["data"].get("sample_fps", 1.0)
+        tolerance_sec = config["evaluation"].get("cut_tolerance_sec", 0.4)
+        tolerance     = max(1, round(tolerance_sec * sample_fps))
+        ev = cut_event_prf(list(val_labels), list(predictions), tolerance)
+        print(f"\nCut events (±{tolerance_sec:.2f}s = ±{tolerance} samples):")
+        print(f"  Ground-truth cuts: {ev['n_gt']}  |  Predicted cuts: {ev['n_pred']}  |  Matched: {ev['tp']}")
+        print(f"  Precision: {ev['precision'] * 100:.1f}%  Recall: {ev['recall'] * 100:.1f}%  F1: {ev['f1'] * 100:.1f}%")
+        logger.info("Cut-event F1: %.1f%%", ev["f1"] * 100)
+    else:
+        print("\n(Cut-event metrics skipped — single-concert split is shuffled, not temporal.)")
 
 
 if __name__ == "__main__":

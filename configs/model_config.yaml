@@ -48,6 +48,20 @@ data:
   # Stack wide + close-up as a 6-channel dual frame. Must match the checkpoint.
   dual_frame: true
 
+  # Keep transition frames (fades/dissolves) instead of dropping them, so the
+  # model sees real cut moments. They get a hard nearest-camera label but a lower
+  # training weight (transition_weight) — a soft/uncertain target, still 2-class.
+  labeling:
+    keep_transitions:  true
+    transition_weight: 0.3
+
+  # Audio branch (log-mel features late-fused into the temporal GRU).
+  # Disabled by default: enabling requires torchaudio decode (torchcodec+ffmpeg).
+  audio:
+    enabled: true
+    sample_rate: 16000
+    n_mels: 32
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Training hyperparameters
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,6 +83,25 @@ model:
   num_classes: 2
   input_size:  [224, 224]
   checkpoint:  "models/view_classifier.pt"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Temporal model
+#
+# The dual-stream comparison features are run through a GRU over a causal window
+# so cut decisions use recent context instead of a single frame. The window is
+# past-heavy with a small bounded lookahead, keeping it compatible with streaming
+# / live inference (only `lookahead` future frames are ever required).
+# ─────────────────────────────────────────────────────────────────────────────
+temporal:
+  window:     5    # frames per sample fed to the GRU
+  lookahead:  1    # future frames in the window (rest are past); 0 = fully causal
+  rnn_hidden: 128  # GRU hidden size
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+evaluation:
+  cut_tolerance_sec: 0.4  # ± window for matching predicted cut events to ground truth
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging

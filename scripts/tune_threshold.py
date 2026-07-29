@@ -69,7 +69,7 @@ def main(config: dict, concert_index: int = 0, check_split: bool = False) -> Non
     if check_split:
         # Full video sampling — slow but confirms the threshold is sensible
         print(f"\nChecking label split at threshold={suggested:.1f} (this may take a few minutes)...")
-        _, labels = generate_training_data(
+        data = generate_training_data(
             total_view_path      = total_view,
             closeup_path         = closeup,
             result_path          = result,
@@ -78,6 +78,7 @@ def main(config: dict, concert_index: int = 0, check_split: bool = False) -> Non
             cache_dir            = config["data"].get("cache_dir", "data/cache"),
             force_rebuild        = True,   # always re-evaluate at the new threshold
         )
+        labels = data.labels
         n = len(labels)
         w = labels.count(0)
         c = labels.count(1)

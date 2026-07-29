@@ -10,11 +10,14 @@ Frames are cached to disk (keyed by paths + settings) so reruns load in seconds.
 import hashlib
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
+
+from src.data.audio import extract_frame_audio_features
 
 try:
     from tqdm import tqdm
@@ -30,6 +33,25 @@ _THUMB_W, _THUMB_H = 160, 90
 # Frames are resized to this before caching and training.
 # Matches MobileNetV3 input size: 3900 frames × 224×224×3 ≈ 590 MB vs ~24 GB at 1080p.
 _STORE_SIZE = (224, 224)  # (width, height) for cv2.resize
+
+
+@dataclass
+class SampleSet:
+    """Per-sample training arrays that must stay index-aligned through splitting.
+
+    frames:  (N, H, W, C) uint8 video frames.
+    labels:  hard nearest-camera class per frame (0 = wide, 1 = close-up).
+    weights: per-sample loss weight; transition frames get < 1 (soft/uncertain).
+    audio:   (N, n_mels) log-mel features, or None when the audio branch is off.
+    """
+
+    frames:  np.ndarray
+    labels:  list[int]
+    weights: list[float]
+    audio:   np.ndarray | None = None
+
+    def __len__(self) -> int:
+        return len(self.frames)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,20 +153,28 @@ def generate_training_data(
     cache_dir:            str   = "data/cache",
     force_rebuild:        bool  = False,
     dual_frame:           bool  = True,
-) -> tuple[np.ndarray, list[int]]:
-    """Generate (frame, label) pairs from three synchronised concert videos.
+    keep_transitions:     bool  = True,
+    transition_weight:    float = 0.3,
+    audio_enabled:        bool  = False,
+    audio_sample_rate:    int   = 16000,
+    audio_n_mels:         int   = 32,
+) -> SampleSet:
+    """Build a labelled SampleSet from three synchronised concert videos.
 
-    Frames are wide+closeup stacked as 6-channel (224×224×6) when dual_frame=True
-    (default), or total_view only (224×224×3) when dual_frame=False.
-    Labels come from comparing result to both cameras.
-    Results are cached to disk keyed by paths + settings.
+    Frames are wide+closeup stacked as 6-channel (224×224×6) when dual_frame=True,
+    else total_view only. Each frame is labelled by whichever camera the edited
+    result matches. Ambiguous transition frames (fades/dissolves) are kept when
+    keep_transitions=True with a lower `transition_weight`, so the model sees real
+    cut moments instead of only clean steady state. Results are cached to disk.
     """
-    # ── Cache lookup ────────────────────────────────────────────────────────
     os.makedirs(cache_dir, exist_ok=True)
-    # Include dual_frame in key so single/dual caches don't collide
-    key_suffix = "_dual" if dual_frame else ""
-    key        = _cache_key(total_view_path, closeup_path, result_path,
-                            sample_fps, similarity_threshold) + key_suffix
+    key_parts = ["dual" if dual_frame else "single"]
+    if keep_transitions:
+        key_parts.append(f"tr{transition_weight}")
+    if audio_enabled:
+        key_parts.append(f"aud{audio_sample_rate}x{audio_n_mels}")
+    key = _cache_key(total_view_path, closeup_path, result_path,
+                     sample_fps, similarity_threshold) + "_" + "_".join(key_parts)
     cache_path = Path(cache_dir) / f"frames_{key}.pt"
 
     if not force_rebuild and cache_path.exists():
@@ -167,10 +197,12 @@ def generate_training_data(
         else:
             cached_frames = np.ascontiguousarray(raw.numpy())
 
-        labels = data["labels"].tolist()
+        labels  = data["labels"].tolist()
+        weights = data["weights"].tolist() if "weights" in data else [1.0] * len(labels)
+        audio   = data["audio"].numpy() if data.get("audio") is not None else None
         del data, raw
         _print_label_summary(labels)
-        return cached_frames, labels
+        return SampleSet(cached_frames, labels, weights, audio)
 
     # ── Video reading ────────────────────────────────────────────────────────
     cap_total   = _open_video(total_view_path)
@@ -188,9 +220,26 @@ def generate_training_data(
         " (dual-frame)" if dual_frame else "",
     )
 
-    frames:  list[np.ndarray] = []
-    labels:  list[int]        = []
-    skipped: int              = 0
+    sample_times = [idx / video_fps for idx in sample_indices]
+    all_audio: np.ndarray | None = None
+    if audio_enabled:
+        logger.info(
+            "Audio enabled: extracting log-mel features (sr=%d, n_mels=%d)",
+            audio_sample_rate,
+            audio_n_mels,
+        )
+        all_audio = extract_frame_audio_features(
+            total_view_path,
+            sample_times,
+            audio_sample_rate,
+            audio_n_mels,
+        )
+
+    frames:         list[np.ndarray] = []
+    labels:         list[int]        = []
+    weights:        list[float]      = []
+    kept_positions: list[int]        = []
+    skipped:        int              = 0
 
     iterable = (
         tqdm(sample_indices, desc="Sampling frames", unit="frame")
@@ -198,7 +247,7 @@ def generate_training_data(
         else sample_indices
     )
 
-    for idx in iterable:
+    for sample_pos, idx in enumerate(iterable):
         ret_t, f_total   = _read_frame_at(cap_total,   idx)
         ret_c, f_closeup = _read_frame_at(cap_closeup, idx)
         ret_r, f_result  = _read_frame_at(cap_result,  idx)
@@ -213,15 +262,19 @@ def generate_training_data(
         closeup_match = diff_to_closeup < similarity_threshold
 
         if wide_match and not closeup_match:
-            label = 0
+            label, weight = 0, 1.0
         elif closeup_match and not wide_match:
-            label = 1
+            label, weight = 1, 1.0
+        elif keep_transitions:
+            # Ambiguous transition (fade/dissolve): keep it so the model sees the
+            # cut moment, hard-labelled by the nearer camera but down-weighted.
+            label  = 0 if diff_to_total <= diff_to_closeup else 1
+            weight = transition_weight
         else:
             skipped += 1
             continue
 
         if dual_frame:
-            # 6-channel: each camera gets full 224×224 resolution
             wide_resized  = cv2.resize(f_total,   _STORE_SIZE)
             close_resized = cv2.resize(f_closeup, _STORE_SIZE)
             frames.append(np.concatenate([wide_resized, close_resized], axis=2))
@@ -229,6 +282,8 @@ def generate_training_data(
             frames.append(cv2.resize(f_total, _STORE_SIZE))
 
         labels.append(label)
+        weights.append(weight)
+        kept_positions.append(sample_pos)
 
     cap_total.release()
     cap_closeup.release()
@@ -243,18 +298,24 @@ def generate_training_data(
     if skipped > 0:
         logger.info("Skipped %d ambiguous frames (transitions/fades)", skipped)
 
-    # Stack into a single tensor for efficient serialisation (one memcpy vs 44k pickle calls)
+    stacked_frames = np.stack(frames)
+    audio = all_audio[kept_positions] if all_audio is not None else None
+    if audio is not None:
+        logger.info("Audio features ready: %d samples x %d mels", audio.shape[0], audio.shape[1])
+
     torch.save(
         {
-            "frames": torch.from_numpy(np.stack(frames)),
-            "labels": torch.tensor(labels, dtype=torch.long),
+            "frames":  torch.from_numpy(stacked_frames),
+            "labels":  torch.tensor(labels, dtype=torch.long),
+            "weights": torch.tensor(weights, dtype=torch.float32),
+            "audio":   torch.from_numpy(audio) if audio is not None else None,
         },
         str(cache_path),
     )
     logger.info("Cached %d labelled frames to %s", len(frames), cache_path)
 
     _print_label_summary(labels)
-    return np.stack(frames), labels
+    return SampleSet(stacked_frames, labels, weights, audio)
 
 
 def _print_label_summary(labels: list[int]) -> None:
@@ -268,48 +329,46 @@ def _print_label_summary(labels: list[int]) -> None:
     )
 
 
-def split_dataset(
-    frames:    np.ndarray,
-    labels:    list[int],
-    val_split: float = 0.2,
-    seed:      int   = 42,
-) -> tuple[np.ndarray, list[int], np.ndarray, list[int]]:
-    """Shuffle and split frames/labels into train/val sets."""
-    n       = len(frames)
-    rng     = np.random.default_rng(seed)
-    indices = rng.permutation(n)
-
-    split        = int(n * (1 - val_split))
-    train_idx    = indices[:split]
-    val_idx      = indices[split:]
-
-    train_frames = frames[train_idx]
-    train_labels = [labels[i] for i in train_idx]
-    val_frames   = frames[val_idx]
-    val_labels   = [labels[i] for i in val_idx]
-
-    return train_frames, train_labels, val_frames, val_labels
+def _subset(data: SampleSet, idx: np.ndarray) -> SampleSet:
+    """Index a SampleSet, keeping frames/labels/weights/audio aligned."""
+    return SampleSet(
+        frames  = data.frames[idx],
+        labels  = [data.labels[i] for i in idx],
+        weights = [data.weights[i] for i in idx],
+        audio   = data.audio[idx] if data.audio is not None else None,
+    )
 
 
-def concert_split(
-    concerts_frames: list[np.ndarray],
-    concerts_labels: list[list[int]],
-    val_concert_idx: int = -1,
-) -> tuple[np.ndarray, list[int], np.ndarray, list[int]]:
+def concat_samplesets(sets: list[SampleSet]) -> SampleSet:
+    """Concatenate SampleSets; audio is kept only if every set has it."""
+    audio = (
+        np.concatenate([s.audio for s in sets if s.audio is not None])
+        if all(s.audio is not None for s in sets) else None
+    )
+    return SampleSet(
+        frames  = np.concatenate([s.frames for s in sets]),
+        labels  = [l for s in sets for l in s.labels],
+        weights = [w for s in sets for w in s.weights],
+        audio   = audio,
+    )
+
+
+def split_dataset(data: SampleSet, val_split: float = 0.2, seed: int = 42) -> tuple[SampleSet, SampleSet]:
+    """Shuffle and split a SampleSet into train/val subsets."""
+    n       = len(data)
+    indices = np.random.default_rng(seed).permutation(n)
+    cut     = int(n * (1 - val_split))
+    return _subset(data, indices[:cut]), _subset(data, indices[cut:])
+
+
+def concert_split(concerts: list[SampleSet], val_concert_idx: int = -1) -> tuple[SampleSet, SampleSet]:
     """Split by concert: train on all except one, validate on the held-out one."""
-    n = len(concerts_frames)
+    n = len(concerts)
     if n < 2:
         raise ValueError(
             "concert_split() requires at least 2 concerts. "
             "Use split_dataset() for single-concert training."
         )
-
-    idx = val_concert_idx % n   # support negative indexing
-
-    train_frames = np.concatenate([concerts_frames[i] for i in range(n) if i != idx])
-    train_labels = [l for i in range(n) if i != idx for l in concerts_labels[i]]
-
-    val_frames = concerts_frames[idx]
-    val_labels = concerts_labels[idx]
-
-    return train_frames, train_labels, val_frames, val_labels
+    idx = val_concert_idx % n
+    train = concat_samplesets([c for i, c in enumerate(concerts) if i != idx])
+    return train, concerts[idx]

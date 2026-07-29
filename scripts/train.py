@@ -3,13 +3,15 @@
 import argparse
 import gc
 
-import numpy as np
 import torch
 import yaml
 
-from src.data.sampler import generate_training_data, concert_split, split_dataset
+from src.data.sampler import (
+    generate_training_data, concert_split, split_dataset, concat_samplesets,
+)
 from src.models.view_classifier import ViewClassifier, _NUM_WORKERS
 from src.utils.logger import setup_logger
+from src.utils.metrics import balanced_accuracy, cut_event_prf
 
 
 def train_model(config: dict) -> None:
@@ -21,12 +23,13 @@ def train_model(config: dict) -> None:
     cache_dir     = config["data"].get("cache_dir", "data/cache")
     force_rebuild = config["data"].get("force_rebuild", False)
     dual_frame    = config["data"].get("dual_frame", True)
+    labeling      = config["data"].get("labeling", {})
+    audio_cfg     = config["data"].get("audio", {})
     val_split     = config["training"].get("val_split", 0.2)
     num_workers   = config["training"].get("num_workers", _NUM_WORKERS)
     batch_size    = config["training"]["batch_size"]
 
-    concerts_frames: list[np.ndarray] = []
-    concerts_labels: list[list[int]]  = []
+    concert_sets: list = []
 
     for i, concert in enumerate(concerts, start=1):
         threshold = concert.get("similarity_threshold",
@@ -36,7 +39,7 @@ def train_model(config: dict) -> None:
         logger.info("  closeup    : %s", concert["closeup"])
         logger.info("  result     : %s", concert["result"])
 
-        frames, labels = generate_training_data(
+        concert_sets.append(generate_training_data(
             total_view_path      = concert["total_view"],
             closeup_path         = concert["closeup"],
             result_path          = concert["result"],
@@ -45,11 +48,14 @@ def train_model(config: dict) -> None:
             cache_dir            = cache_dir,
             force_rebuild        = force_rebuild,
             dual_frame           = dual_frame,
-        )
-        concerts_frames.append(frames)
-        concerts_labels.append(labels)
+            keep_transitions     = labeling.get("keep_transitions", True),
+            transition_weight    = labeling.get("transition_weight", 0.3),
+            audio_enabled        = audio_cfg.get("enabled", False),
+            audio_sample_rate    = audio_cfg.get("sample_rate", 16000),
+            audio_n_mels         = audio_cfg.get("n_mels", 32),
+        ))
 
-    total_frames = sum(len(f) for f in concerts_frames)
+    total_frames = sum(len(s) for s in concert_sets)
     if total_frames == 0:
         logger.error("No frames sampled. Check video paths in configs/model_config.yaml.")
         return
@@ -63,51 +69,90 @@ def train_model(config: dict) -> None:
             "Using concert-level split: training on concerts 1–%d, validating on concert %d.",
             len(concerts) - 1, len(concerts),
         )
-        train_frames, train_labels, val_frames, val_labels = concert_split(
-            concerts_frames, concerts_labels, val_concert_idx=-1
-        )
+        train_data, val_data = concert_split(concert_sets, val_concert_idx=-1)
     else:
         if force_random:
             logger.info("Using random frame-level split (--random-split diagnostic mode).")
         else:
             logger.info("Single concert: using shuffled 80/20 frame-level split.")
-        all_frames = np.concatenate(concerts_frames)
-        all_labels = [l for cl in concerts_labels for l in cl]
-        train_frames, train_labels, val_frames, val_labels = split_dataset(
-            all_frames, all_labels, val_split=val_split
+        train_data, val_data = split_dataset(
+            concat_samplesets(concert_sets), val_split=val_split
         )
 
-    # Free per-concert lists — train/val now hold the only references we need.
-    del concerts_frames, concerts_labels
+    del concert_sets
     gc.collect()
 
-    logger.info(
-        "Split: %d train frames / %d val frames",
-        len(train_frames), len(val_frames),
-    )
+    logger.info("Split: %d train frames / %d val frames", len(train_data), len(val_data))
 
+    audio_dim = audio_cfg.get("n_mels", 32) if audio_cfg.get("enabled", False) else 0
     classifier = ViewClassifier(
         num_classes = config["model"].get("num_classes", 2),
         dual_frame  = dual_frame,
+        window      = config["temporal"].get("window", 5),
+        lookahead   = config["temporal"].get("lookahead", 1),
+        rnn_hidden  = config["temporal"].get("rnn_hidden", 128),
+        audio_dim   = audio_dim,
+        audio_sample_rate = audio_cfg.get("sample_rate", 16000),
     )
     logger.info("Using device: %s", classifier.device)
 
     classifier.train(
-        train_frames = train_frames,
-        train_labels = train_labels,
-        val_frames   = val_frames,
-        val_labels   = val_labels,
-        epochs       = config["training"]["epochs"],
-        batch_size   = batch_size,
-        lr           = config["training"]["learning_rate"],
-        patience     = config["training"].get("patience", 15),
-        num_workers  = num_workers,
+        train_data  = train_data,
+        val_data    = val_data,
+        epochs      = config["training"]["epochs"],
+        batch_size  = batch_size,
+        lr          = config["training"]["learning_rate"],
+        patience    = config["training"].get("patience", 15),
+        num_workers = num_workers,
     )
 
     save_path = config["model"]["checkpoint"]
     classifier.save(save_path)
     logger.info("Model saved to %s", save_path)
+
+    _report_per_concert(config, classifier, logger)
     logger.info("Training complete.")
+
+
+def _report_per_concert(config: dict, classifier: ViewClassifier, logger) -> None:
+    """Score each concert on its own so overfitting to a single venue/rig is visible.
+
+    Concerts used for training will score higher than the held-out one; a large gap
+    signals poor generalisation. Uses cached frames, so this is cheap.
+    """
+    concerts      = config["data"]["concerts"]
+    sample_fps    = config["data"].get("sample_fps", 1.0)
+    cache_dir     = config["data"].get("cache_dir", "data/cache")
+    dual_frame    = config["data"].get("dual_frame", True)
+    labeling      = config["data"].get("labeling", {})
+    audio_cfg     = config["data"].get("audio", {})
+    tolerance     = max(1, round(config["evaluation"].get("cut_tolerance_sec", 0.4) * sample_fps))
+
+    logger.info("Per-concert validation (each concert scored independently):")
+    for i, concert in enumerate(concerts, start=1):
+        threshold = concert.get("similarity_threshold",
+                                config["data"].get("similarity_threshold", 39))
+        data = generate_training_data(
+            total_view_path      = concert["total_view"],
+            closeup_path         = concert["closeup"],
+            result_path          = concert["result"],
+            sample_fps           = sample_fps,
+            similarity_threshold = threshold,
+            cache_dir            = cache_dir,
+            dual_frame           = dual_frame,
+            keep_transitions     = labeling.get("keep_transitions", True),
+            transition_weight    = labeling.get("transition_weight", 0.3),
+            audio_enabled        = audio_cfg.get("enabled", False),
+            audio_sample_rate    = audio_cfg.get("sample_rate", 16000),
+            audio_n_mels         = audio_cfg.get("n_mels", 32),
+        )
+        preds = classifier.predict_batch(data.frames, audio=data.audio)
+        bal   = balanced_accuracy(data.labels, preds)
+        ev    = cut_event_prf(data.labels, preds, tolerance)
+        logger.info(
+            "  Concert %d: balAcc %.1f%% | cut F1 %.1f%% (gt %d / pred %d)",
+            i, bal * 100, ev["f1"] * 100, ev["n_gt"], ev["n_pred"],
+        )
 
 
 if __name__ == "__main__":

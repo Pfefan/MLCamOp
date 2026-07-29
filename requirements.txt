@@ -1,6 +1,7 @@
 # Core ML
 torch
 torchvision
+torchaudio  # audio branch (log-mel features); decode needs torchcodec + ffmpeg
 
 # Video processing
 opencv-python

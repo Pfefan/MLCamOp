@@ -8,7 +8,7 @@ MobileNetV3-Small pretrained on ImageNet, fine-tuned on concert footage with:
 """
 
 import os
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -19,6 +19,9 @@ from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 import torchvision.transforms.v2 as T
+
+if TYPE_CHECKING:
+    from src.data.sampler import SampleSet
 
 try:
     from tqdm import tqdm
@@ -38,11 +41,19 @@ _INPUT_SIZE    = (224, 224)
 # dataset per worker.  Keep workers low on RAM-constrained systems.
 _NUM_WORKERS = 2
 
-# Temporal sliding window: the dataset yields K consecutive frame pairs per
-# sample.  The model mean-pools comparison features across K steps, giving it
-# 2-3 seconds of context about which camera has been "active" recently.
-# K=1 disables temporal context and behaves like the original single-frame mode.
+# Temporal sliding window defaults (overridable per ViewClassifier from config).
+# Each sample is a window of K consecutive frame pairs. The window is causal:
+# past-heavy with a small bounded lookahead, so the same code path works for
+# streaming / live inference (only _LOOKAHEAD future frames are ever needed).
 _TEMPORAL_WINDOW = 5
+_LOOKAHEAD       = 1
+_RNN_HIDDEN      = 128
+
+
+def _causal_window_indices(idx: int, n: int, window: int, lookahead: int) -> list[int]:
+    """Edge-clamped frame indices for a causal window ending `lookahead` ahead of idx."""
+    start = idx - (window - 1 - lookahead)
+    return [min(n - 1, max(0, start + i)) for i in range(window)]
 
 # Augmentation pipelines applied only during training.
 _SPATIAL_AUGMENT = T.Compose([
@@ -223,45 +234,42 @@ def _build_mobilenet(num_classes: int) -> nn.Module:
 
 
 class _DualStreamModel(nn.Module):
-    """Siamese architecture: shared MobileNetV3 backbone processes each camera
-    independently, then a classification head compares the two feature vectors.
+    """Siamese backbone + temporal GRU over a causal window.
 
-    Uses standard Siamese comparison features: concat, absolute difference, and
-    element-wise product — giving the head explicit similarity/difference signals
-    rather than forcing it to discover comparison from raw concatenation alone.
+    A shared MobileNetV3 backbone encodes each camera per frame, producing Siamese
+    comparison features [wide, close, |wide-close|, wide*close] at each timestep.
+    A GRU consumes the sequence of comparison vectors (plus optional audio features)
+    and its final hidden state — the causal summary at the decision point — is
+    classified. This replaces the earlier temporal mean-pool, which discarded order
+    and produced jittery per-frame predictions.
 
     The last 5 feature blocks are unfrozen; earlier blocks stay frozen to preserve
     generic ImageNet features and prevent overfitting to just 2-3 training concerts.
     """
 
-    # Number of trailing feature blocks to unfreeze (out of 13 total)
     _UNFREEZE_BLOCKS = 5
+    _COMPARISON_DIM  = 576 * 4  # [wide, close, |diff|, prod] over 576-d features
 
-    def __init__(self, num_classes: int = 2):
+    def __init__(self, num_classes: int = 2, rnn_hidden: int = _RNN_HIDDEN, audio_dim: int = 0):
         super().__init__()
         base = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1)
 
-        # Shared feature extractor (standard 3-channel pretrained backbone)
         self.features = base.features
         self.avgpool  = base.avgpool
 
-        # Freeze all blocks, then selectively unfreeze the last _UNFREEZE_BLOCKS.
-        # Unfreezing everything caused massive overfitting: val loss 0.87 → 3.8+
-        # across 39 epochs with 56K training samples from only 2 concerts.
         for param in self.features.parameters():
             param.requires_grad = False
         for block in self.features[-self._UNFREEZE_BLOCKS :]:
             for param in block.parameters():
                 param.requires_grad = True
 
-        # Classification head with Siamese comparison features:
-        # [wide, close, |wide-close|, wide*close] → 576 * 4 = 2304 dims
-        feat_dim = 576
+        self.temporal = nn.GRU(
+            input_size=self._COMPARISON_DIM + audio_dim,
+            hidden_size=rnn_hidden,
+            batch_first=True,
+        )
         self.head = nn.Sequential(
-            nn.Linear(feat_dim * 4, 256),
-            nn.Hardswish(),
-            nn.Dropout(p=0.4),
-            nn.Linear(256, 128),
+            nn.Linear(rnn_hidden, 128),
             nn.Hardswish(),
             nn.Dropout(p=0.3),
             nn.Linear(128, num_classes),
@@ -276,12 +284,11 @@ class _DualStreamModel(nn.Module):
         x = self.avgpool(x)
         return x.flatten(1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, K*6, H, W) → per-frame Siamese comparison → temporal mean → classify.
+    def forward(self, x: torch.Tensor, audio: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """x: (B, K*6, H, W); optional audio: (B, K, audio_dim).
 
-        K=1 (single frame pair): standard Siamese compare.
-        K>1 (temporal window):   compare each frame pair, mean-pool across time,
-                                  then classify — giving the head 2-3 s of context.
+        Per-frame Siamese comparison → GRU over the causal window → classify the
+        final hidden state (the summary at the most recent, decision-point frame).
         """
         K = x.shape[1] // 6
         comparisons: list[torch.Tensor] = []
@@ -294,9 +301,13 @@ class _DualStreamModel(nn.Module):
                 torch.abs(wide_feat - close_feat),
                 wide_feat * close_feat,
             ], dim=1))
-        # (B, K, 2304) → mean over temporal dim → (B, 2304)
-        pooled = torch.stack(comparisons, dim=1).mean(dim=1)
-        return self.head(pooled)
+
+        seq = torch.stack(comparisons, dim=1)  # (B, K, comparison_dim)
+        if audio is not None:
+            seq = torch.cat([seq, audio], dim=2)
+
+        _, hidden = self.temporal(seq)         # hidden: (1, B, rnn_hidden)
+        return self.head(hidden[-1])
 
 
 class _FrameDataset(torch.utils.data.Dataset):
@@ -319,31 +330,45 @@ class _FrameDataset(torch.utils.data.Dataset):
         frames: np.ndarray,
         labels: list[int],
         augment: bool = False,
+        window: int = _TEMPORAL_WINDOW,
+        lookahead: int = _LOOKAHEAD,
+        weights: list[float] | None = None,
+        audio: np.ndarray | None = None,
     ):
         if not isinstance(frames, np.ndarray):
             frames = np.asarray(frames)
-        self.frames  = frames
-        self.labels  = labels
-        self.augment = augment
+        self.frames    = frames
+        self.labels    = labels
+        self.augment   = augment
+        self.window    = window
+        self.lookahead = lookahead
+        self.weights   = weights
+        self.audio     = audio
 
     def __len__(self) -> int:
         return len(self.frames)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+    def __getitem__(self, idx: int):
         tensor = self._build_window(idx)
         if self.augment:
             tensor = _augment_tensor(tensor)
-        return tensor, self.labels[idx]
+        if self.weights is None and self.audio is None:
+            return tensor, self.labels[idx]
+        weight = self.weights[idx] if self.weights is not None else 1.0
+        audio  = self._audio_window(idx) if self.audio is not None else torch.zeros(0)
+        return tensor, self.labels[idx], weight, audio
+
+    def _audio_window(self, idx: int) -> torch.Tensor:
+        """Per-frame audio features for the same causal window as the visual frames."""
+        indices = _causal_window_indices(idx, len(self.frames), self.window, self.lookahead)
+        return torch.from_numpy(self.audio[indices]).float()  # (window, n_mels)
 
     def _build_window(self, idx: int) -> torch.Tensor:
-        """Return K frames centred on *idx* as a (K*6, H, W) uint8 tensor.
+        """Return the causal window at *idx* as a (window*6, H, W) uint8 tensor.
 
         Kept as uint8 — normalisation is deferred to the GPU (_normalize_windows).
         """
-        n    = len(self.frames)
-        K    = _TEMPORAL_WINDOW
-        half = K // 2
-        indices = [max(0, min(n - 1, idx + i - half)) for i in range(K)]
+        indices = _causal_window_indices(idx, len(self.frames), self.window, self.lookahead)
         return torch.cat([_frame_to_uint8_chw(self.frames[j]) for j in indices], dim=0)
 
 
@@ -371,9 +396,23 @@ class ViewClassifier:
     Wraps MobileNetV3-Small pretrained on ImageNet, fine-tuned on concert data.
     """
 
-    def __init__(self, num_classes: int = 2, dual_frame: bool = True):
+    def __init__(
+        self,
+        num_classes: int = 2,
+        dual_frame:  bool = True,
+        window:      int = _TEMPORAL_WINDOW,
+        lookahead:   int = _LOOKAHEAD,
+        rnn_hidden:  int = _RNN_HIDDEN,
+        audio_dim:   int = 0,
+        audio_sample_rate: int = 16000,
+    ):
         self.num_classes = num_classes
         self.dual_frame  = dual_frame
+        self.window      = window
+        self.lookahead   = lookahead
+        self.rnn_hidden  = rnn_hidden
+        self.audio_dim   = audio_dim
+        self.audio_sample_rate = audio_sample_rate
         self.device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # channels_last (#2): conv backbones run faster in NHWC under AMP.
         self.model       = self._make_model().to(
@@ -387,17 +426,21 @@ class ViewClassifier:
     def _make_model(self) -> nn.Module:
         """Build the appropriate architecture."""
         if self.dual_frame:
-            return _DualStreamModel(self.num_classes)
+            return _DualStreamModel(self.num_classes, rnn_hidden=self.rnn_hidden, audio_dim=self.audio_dim)
         return _build_mobilenet(self.num_classes)
+
+    def _forward(self, x: torch.Tensor, audio: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Run the forward handle, passing audio only to the dual-stream model."""
+        if self.dual_frame:
+            return self._model_fwd(x, audio)
+        return self._model_fwd(x)
 
     # ── Training ──────────────────────────────────────────────────────────────
 
     def train(
         self,
-        train_frames: np.ndarray,
-        train_labels: list[int],
-        val_frames:   np.ndarray,
-        val_labels:   list[int],
+        train_data:  "SampleSet",
+        val_data:    "SampleSet",
         epochs:       int   = 40,
         batch_size:   int   = 32,
         lr:           float = 3e-4,
@@ -405,8 +448,15 @@ class ViewClassifier:
         num_workers:  int   = _NUM_WORKERS,
     ) -> None:
         """Fine-tune with mixed-precision, early stopping on balanced accuracy."""
-        train_ds = _FrameDataset(train_frames, train_labels, augment=True)
-        val_ds   = _FrameDataset(val_frames,   val_labels,   augment=False)
+        train_frames, train_labels = train_data.frames, train_data.labels
+        val_frames,   val_labels   = val_data.frames,   val_data.labels
+
+        train_ds = _FrameDataset(train_frames, train_labels, augment=True,
+                                 window=self.window, lookahead=self.lookahead,
+                                 weights=train_data.weights, audio=train_data.audio)
+        val_ds   = _FrameDataset(val_frames,   val_labels,   augment=False,
+                                 window=self.window, lookahead=self.lookahead,
+                                 weights=val_data.weights, audio=val_data.audio)
 
         # pin_memory speeds up CPU→GPU transfers but requires extra page-locked
         # RAM.  Disable it when workers=0 (no async prefetch anyway) or when
@@ -436,7 +486,7 @@ class ViewClassifier:
 
         y_train = torch.tensor(train_labels, dtype=torch.long)
         class_weights = _make_class_weights(y_train, self.device)
-        criterion     = nn.CrossEntropyLoss(weight=class_weights)
+        criterion     = nn.CrossEntropyLoss(weight=class_weights, reduction="none")
 
         # Differential learning rates — 3 tiers across the unfrozen backbone blocks.
         # Works for both architectures:
@@ -445,7 +495,7 @@ class ViewClassifier:
         features = self.model.features
 
         if self.dual_frame:
-            head_params = list(self.model.head.parameters())
+            head_params = list(self.model.head.parameters()) + list(self.model.temporal.parameters())
             unfreeze = self.model._UNFREEZE_BLOCKS
             # 3 tiers across the unfrozen blocks: deep → mid → top
             deep_params = [p for b in self.model.features[-unfreeze    :-unfreeze//2] for p in b.parameters() if p.requires_grad]
@@ -546,15 +596,17 @@ class ViewClassifier:
         total_loss = 0.0
 
         with torch.set_grad_enabled(training):
-            for batch_x, batch_y in loader:
+            for batch_x, batch_y, batch_w, batch_a in loader:
                 # uint8 window → GPU (4× smaller transfer) → normalise on GPU (#1).
-                batch_x = batch_x.to(self.device, non_blocking=True)
+                batch_x = _normalize_windows(batch_x.to(self.device, non_blocking=True))
                 batch_y = batch_y.to(self.device, non_blocking=True)
-                batch_x = _normalize_windows(batch_x)
+                batch_w = batch_w.to(self.device, non_blocking=True).float()
+                audio   = batch_a.to(self.device).float() if batch_a.numel() else None
 
                 with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
-                    outputs = self._model_fwd(batch_x)
-                    loss    = criterion(outputs, batch_y)
+                    outputs = self._forward(batch_x, audio)
+                    # Per-sample loss weighted so transition frames count less (#5).
+                    loss    = (criterion(outputs, batch_y) * batch_w).mean()
 
                 if training:
                     optimizer.zero_grad(set_to_none=True)
@@ -576,13 +628,14 @@ class ViewClassifier:
 
         self.model.eval()
         with torch.no_grad():
-            for batch_x, batch_y in loader:
-                batch_x = batch_x.to(self.device, non_blocking=True)
+            for batch_x, batch_y, batch_w, batch_a in loader:
+                batch_x = _normalize_windows(batch_x.to(self.device, non_blocking=True))
                 batch_y = batch_y.to(self.device, non_blocking=True)
-                batch_x = _normalize_windows(batch_x)
+                batch_w = batch_w.to(self.device, non_blocking=True).float()
+                audio   = batch_a.to(self.device).float() if batch_a.numel() else None
                 with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
-                    outputs    = self._model_fwd(batch_x)
-                    total_loss += criterion(outputs, batch_y).item()
+                    outputs     = self._forward(batch_x, audio)
+                    total_loss += ((criterion(outputs, batch_y) * batch_w).mean()).item()
                 preds = torch.argmax(outputs, dim=1)
                 all_preds.extend(preds.cpu().tolist())
                 all_labels.extend(batch_y.cpu().tolist())
@@ -608,40 +661,59 @@ class ViewClassifier:
     # ── Inference ─────────────────────────────────────────────────────────────
 
     def predict(self, frame: np.ndarray) -> int:
-        """Predict for a single frame, repeating it K times as temporal context.
+        """Predict for a single frame by repeating it across the window."""
+        frames = np.stack([frame] * self.window)
+        return self.predict_batch(frames)[self.window // 2]
 
-        For proper temporal context pass consecutive frames via predict_batch().
+    def predict_window(self, window_frames: list[np.ndarray], window_audio: np.ndarray | None = None) -> int:
+        """Classify one explicit causal window of `self.window` frames (+ optional audio).
+
+        Used by streaming inference, which owns the ring buffer of decoded frames.
         """
-        frames = np.stack([frame] * _TEMPORAL_WINDOW)
-        return self.predict_batch(frames)[_TEMPORAL_WINDOW // 2]
+        x = torch.cat([_frame_to_uint8_chw(f) for f in window_frames], dim=0)
+        x = _normalize_windows(x.unsqueeze(0).to(self.device, non_blocking=True))
+        audio = None
+        if window_audio is not None:
+            audio = torch.from_numpy(window_audio).float().unsqueeze(0).to(self.device)
+        self.model.eval()
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
+                logits = self._forward(x, audio)
+        return int(torch.argmax(logits, dim=1).item())
 
-    def predict_batch(self, frames: np.ndarray | list[np.ndarray], batch_size: int = 128) -> list[int]:
-        """Predict labels for a sequence of frames with temporal context.
+    def predict_batch(
+        self,
+        frames:     np.ndarray | list[np.ndarray],
+        audio:      np.ndarray | None = None,
+        batch_size: int = 128,
+    ) -> list[int]:
+        """Predict a label per frame using the causal temporal window.
 
-        Frames should be passed as one contiguous array of consecutive frames so
-        that temporal windows are built correctly.  Each index i gets a window of
-        the _TEMPORAL_WINDOW frames centred on i (edge-clamped).
+        Frames must be one contiguous array of consecutive frames so windows are
+        built correctly. Each index i is scored from its causal window (past
+        frames plus `self.lookahead` future frames), edge-clamped at boundaries.
+        Pass `audio` (N, n_mels) when the model has an audio branch.
         """
         self.model.eval()
         all_preds: list[int] = []
 
         if not isinstance(frames, np.ndarray):
             frames = np.asarray(frames)
-        n    = len(frames)
-        K    = _TEMPORAL_WINDOW
-        half = K // 2
+        n = len(frames)
 
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
-            windows = []
+            windows, audio_windows = [], []
             for idx in range(start, end):
-                indices = [max(0, min(n - 1, idx + i - half)) for i in range(K)]
+                indices = _causal_window_indices(idx, n, self.window, self.lookahead)
                 windows.append(torch.cat([_frame_to_uint8_chw(frames[j]) for j in indices], dim=0))
-            x = torch.stack(windows).to(self.device, non_blocking=True)
-            x = _normalize_windows(x)
+                if audio is not None:
+                    audio_windows.append(torch.from_numpy(audio[indices]).float())
+            x = _normalize_windows(torch.stack(windows).to(self.device, non_blocking=True))
+            a = torch.stack(audio_windows).to(self.device) if audio is not None else None
             with torch.no_grad():
                 with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
-                    logits = getattr(self, "_model_fwd", self.model)(x)
+                    logits = self._forward(x, a)
             all_preds.extend(torch.argmax(logits, dim=1).cpu().tolist())
 
         return all_preds
@@ -654,35 +726,38 @@ class ViewClassifier:
         if parent:
             os.makedirs(parent, exist_ok=True)
         torch.save(
-            {"state_dict": self.model.state_dict(), "dual_frame": self.dual_frame},
+            {
+                "state_dict": self.model.state_dict(),
+                "dual_frame": self.dual_frame,
+                "num_classes": self.num_classes,
+                "window": self.window,
+                "lookahead": self.lookahead,
+                "rnn_hidden": self.rnn_hidden,
+                "audio_dim": self.audio_dim,
+                "audio_sample_rate": self.audio_sample_rate,
+            },
             path,
         )
         print(f"Model saved to {path}")
 
     def load(self, path: str) -> None:
-        """Load model weights from disk.
-
-        Automatically detects dual_frame from checkpoint and rebuilds
-        the architecture if needed.
-        """
+        """Load model weights, rebuilding the architecture to match the checkpoint."""
         data = torch.load(path, map_location=self.device, weights_only=False)
 
-        # Support both old (bare state_dict) and new (dict with metadata) formats
         if isinstance(data, dict) and "state_dict" in data:
-            state      = data["state_dict"]
-            dual_frame = data.get("dual_frame", False)
+            state = data["state_dict"]
+            self.dual_frame  = data.get("dual_frame", self.dual_frame)
+            self.num_classes = data.get("num_classes", self.num_classes)
+            self.window      = data.get("window", self.window)
+            self.lookahead   = data.get("lookahead", self.lookahead)
+            self.rnn_hidden  = data.get("rnn_hidden", self.rnn_hidden)
+            self.audio_dim   = data.get("audio_dim", self.audio_dim)
+            self.audio_sample_rate = data.get("audio_sample_rate", self.audio_sample_rate)
         else:
-            state      = data
-            dual_frame = False
+            state = data
 
-        # Rebuild model if dual_frame flag doesn't match
-        if dual_frame != self.dual_frame:
-            self.dual_frame = dual_frame
-            self.model      = self._make_model().to(
-                self.device, memory_format=torch.channels_last
-            )
-            self._model_fwd = self.model
-
+        self.model = self._make_model().to(self.device, memory_format=torch.channels_last)
+        self._model_fwd = self.model
         self.model.load_state_dict(state)
         self.is_trained = True
         print(f"Model loaded from {path}")
