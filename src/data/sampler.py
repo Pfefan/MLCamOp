@@ -75,12 +75,6 @@ def _open_video(path: str) -> cv2.VideoCapture:
     return cap
 
 
-def _read_frame_at(cap: cv2.VideoCapture, frame_idx: int) -> tuple[bool, np.ndarray | None]:
-    """Seek to *frame_idx* and decode that one frame."""
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-    return cap.read()
-
-
 def _cache_key(total_view_path: str, closeup_path: str, result_path: str,
                sample_fps: float, threshold: float) -> str:
     """Hash of paths + settings so the cache is invalidated on any change."""
@@ -110,18 +104,25 @@ def compute_similarity_stats(
 
     # Sample evenly across the video rather than randomly to avoid clustering
     sample_indices = list(range(0, total_frames, frame_interval))[:n_samples]
+    last_sample    = sample_indices[-1] if sample_indices else 0
 
     diffs_total:   list[float] = []
     diffs_closeup: list[float] = []
 
-    for idx in sample_indices:
-        ret_t, f_total   = _read_frame_at(cap_total,   idx)
-        ret_c, f_closeup = _read_frame_at(cap_closeup, idx)
-        ret_r, f_result  = _read_frame_at(cap_result,  idx)
-        if not (ret_t and ret_c and ret_r):
-            continue
-        diffs_total.append(_pixel_diff(f_result, f_total))
-        diffs_closeup.append(_pixel_diff(f_result, f_closeup))
+    # Sequential decode (grab all, retrieve only at sample points) — far faster
+    # than seeking to each sample.
+    idx = 0
+    while idx <= last_sample:
+        if not (cap_total.grab() and cap_closeup.grab() and cap_result.grab()):
+            break
+        if idx % frame_interval == 0:
+            ret_t, f_total   = cap_total.retrieve()
+            ret_c, f_closeup = cap_closeup.retrieve()
+            ret_r, f_result  = cap_result.retrieve()
+            if ret_t and ret_c and ret_r:
+                diffs_total.append(_pixel_diff(f_result, f_total))
+                diffs_closeup.append(_pixel_diff(f_result, f_closeup))
+        idx += 1
 
     cap_total.release()
     cap_closeup.release()
@@ -158,6 +159,7 @@ def generate_training_data(
     audio_enabled:        bool  = False,
     audio_sample_rate:    int   = 16000,
     audio_n_mels:         int   = 32,
+    cache_id:             str | None = None,
 ) -> SampleSet:
     """Build a labelled SampleSet from three synchronised concert videos.
 
@@ -173,8 +175,16 @@ def generate_training_data(
         key_parts.append(f"tr{transition_weight}")
     if audio_enabled:
         key_parts.append(f"aud{audio_sample_rate}x{audio_n_mels}")
-    key = _cache_key(total_view_path, closeup_path, result_path,
-                     sample_fps, similarity_threshold) + "_" + "_".join(key_parts)
+    # A stable per-concert `cache_id` makes the cache filename independent of the
+    # (machine-specific) video paths, so caches are portable between systems.
+    # Without one, fall back to hashing the paths (legacy behaviour).
+    if cache_id:
+        settings = hashlib.md5(f"{sample_fps}|{similarity_threshold}".encode()).hexdigest()[:6]
+        base = f"{cache_id}_{settings}"
+    else:
+        base = _cache_key(total_view_path, closeup_path, result_path,
+                          sample_fps, similarity_threshold)
+    key = base + "_" + "_".join(key_parts)
     cache_path = Path(cache_dir) / f"frames_{key}.pt"
 
     if not force_rebuild and cache_path.exists():
@@ -235,61 +245,80 @@ def generate_training_data(
             audio_n_mels,
         )
 
-    frames:         list[np.ndarray] = []
+    # Pre-allocated frame buffer (upper bound = every sample kept). Filling in
+    # place and saving a [:count] view avoids the full-size np.stack() copy that
+    # doubled peak RAM at save time. np.empty pages are only committed on write,
+    # so unused tail rows cost nothing.
+    store_w, store_h = _STORE_SIZE
+    n_channels = 6 if dual_frame else 3
+    frame_buf = np.empty((len(sample_indices), store_h, store_w, n_channels), dtype=np.uint8)
+    count:          int              = 0
     labels:         list[int]        = []
     weights:        list[float]      = []
     kept_positions: list[int]        = []
     skipped:        int              = 0
 
-    iterable = (
-        tqdm(sample_indices, desc="Sampling frames", unit="frame")
-        if _TQDM_AVAILABLE
-        else sample_indices
+    # Sequential decode: grab() every frame (unavoidable for inter-frame codecs)
+    # but only retrieve()/convert the sampled ones. This avoids the per-sample
+    # keyframe seek that made random access an order of magnitude slower.
+    progress = (
+        tqdm(total=len(sample_indices), desc="Sampling frames", unit="frame")
+        if _TQDM_AVAILABLE else None
     )
 
-    for sample_pos, idx in enumerate(iterable):
-        ret_t, f_total   = _read_frame_at(cap_total,   idx)
-        ret_c, f_closeup = _read_frame_at(cap_closeup, idx)
-        ret_r, f_result  = _read_frame_at(cap_result,  idx)
+    idx = 0
+    while idx < total_frames:
+        if not (cap_total.grab() and cap_closeup.grab() and cap_result.grab()):
+            break
 
-        if not (ret_t and ret_c and ret_r):
-            continue
+        if idx % frame_interval == 0:
+            ret_t, f_total   = cap_total.retrieve()
+            ret_c, f_closeup = cap_closeup.retrieve()
+            ret_r, f_result  = cap_result.retrieve()
+            if progress is not None:
+                progress.update(1)
 
-        diff_to_total   = _pixel_diff(f_result, f_total)
-        diff_to_closeup = _pixel_diff(f_result, f_closeup)
+            if ret_t and ret_c and ret_r:
+                diff_to_total   = _pixel_diff(f_result, f_total)
+                diff_to_closeup = _pixel_diff(f_result, f_closeup)
 
-        wide_match    = diff_to_total   < similarity_threshold
-        closeup_match = diff_to_closeup < similarity_threshold
+                wide_match    = diff_to_total   < similarity_threshold
+                closeup_match = diff_to_closeup < similarity_threshold
 
-        if wide_match and not closeup_match:
-            label, weight = 0, 1.0
-        elif closeup_match and not wide_match:
-            label, weight = 1, 1.0
-        elif keep_transitions:
-            # Ambiguous transition (fade/dissolve): keep it so the model sees the
-            # cut moment, hard-labelled by the nearer camera but down-weighted.
-            label  = 0 if diff_to_total <= diff_to_closeup else 1
-            weight = transition_weight
-        else:
-            skipped += 1
-            continue
+                if wide_match and not closeup_match:
+                    label, weight = 0, 1.0
+                elif closeup_match and not wide_match:
+                    label, weight = 1, 1.0
+                elif keep_transitions:
+                    # Ambiguous transition (fade/dissolve): keep it so the model
+                    # sees the cut moment, hard-labelled by the nearer camera but
+                    # down-weighted.
+                    label, weight = (0 if diff_to_total <= diff_to_closeup else 1), transition_weight
+                else:
+                    label, weight = None, 0.0
 
-        if dual_frame:
-            wide_resized  = cv2.resize(f_total,   _STORE_SIZE)
-            close_resized = cv2.resize(f_closeup, _STORE_SIZE)
-            frames.append(np.concatenate([wide_resized, close_resized], axis=2))
-        else:
-            frames.append(cv2.resize(f_total, _STORE_SIZE))
+                if label is not None:
+                    if dual_frame:
+                        frame_buf[count, :, :, :3] = cv2.resize(f_total,   _STORE_SIZE)
+                        frame_buf[count, :, :, 3:] = cv2.resize(f_closeup, _STORE_SIZE)
+                    else:
+                        frame_buf[count] = cv2.resize(f_total, _STORE_SIZE)
+                    labels.append(label)
+                    weights.append(weight)
+                    kept_positions.append(idx // frame_interval)
+                    count += 1
+                else:
+                    skipped += 1
+        idx += 1
 
-        labels.append(label)
-        weights.append(weight)
-        kept_positions.append(sample_pos)
+    if progress is not None:
+        progress.close()
 
     cap_total.release()
     cap_closeup.release()
     cap_result.release()
 
-    if not frames:
+    if count == 0:
         raise RuntimeError(
             "No labelled frames generated.  Check video paths and run "
             "scripts/tune_threshold.py to calibrate similarity_threshold."
@@ -298,7 +327,7 @@ def generate_training_data(
     if skipped > 0:
         logger.info("Skipped %d ambiguous frames (transitions/fades)", skipped)
 
-    stacked_frames = np.stack(frames)
+    stacked_frames = frame_buf[:count]
     audio = all_audio[kept_positions] if all_audio is not None else None
     if audio is not None:
         logger.info("Audio features ready: %d samples x %d mels", audio.shape[0], audio.shape[1])
@@ -312,7 +341,7 @@ def generate_training_data(
         },
         str(cache_path),
     )
-    logger.info("Cached %d labelled frames to %s", len(frames), cache_path)
+    logger.info("Cached %d labelled frames to %s", count, cache_path)
 
     _print_label_summary(labels)
     return SampleSet(stacked_frames, labels, weights, audio)

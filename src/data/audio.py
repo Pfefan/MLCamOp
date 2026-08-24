@@ -1,8 +1,9 @@
 """Per-frame audio features (log-mel) aligned to sampled video timestamps.
 
-The mel transform is pure torch; only decoding the audio track from the video
-container needs torchaudio's I/O backend (torchcodec + ffmpeg). Decode failures
-raise an actionable error so the caller can install the backend or disable audio.
+Decoding streams the audio track in fixed-duration chunks (resampled and
+downmixed to mono on decode), so peak memory stays flat regardless of video
+length — a multi-hour concert never loads its whole waveform into RAM. The mel
+transform itself is pure torch.
 """
 
 import numpy as np
@@ -10,33 +11,13 @@ import torch
 
 try:
     import torchaudio
-    _TORCHAUDIO_AVAILABLE = True
+    from torchcodec.decoders import AudioDecoder
+    _AUDIO_AVAILABLE = True
 except ImportError:
-    _TORCHAUDIO_AVAILABLE = False
+    _AUDIO_AVAILABLE = False
 
-_HOP_LENGTH = 512
-
-
-def _load_mono(video_path: str, target_sr: int) -> torch.Tensor:
-    """Decode the audio track to a mono waveform at `target_sr`."""
-    if not _TORCHAUDIO_AVAILABLE:
-        raise RuntimeError(
-            "Audio branch enabled but torchaudio is not installed. "
-            "Install it or set data.audio.enabled: false."
-        )
-    try:
-        waveform, sr = torchaudio.load(video_path)
-    except Exception as exc:  # decode backend (torchcodec/ffmpeg) missing or no track
-        raise RuntimeError(
-            f"Failed to decode audio from {video_path}: {exc}. "
-            "torchaudio audio decode needs torchcodec + ffmpeg; install them, "
-            "or set data.audio.enabled: false."
-        ) from exc
-
-    waveform = waveform.mean(dim=0, keepdim=True)  # mono
-    if sr != target_sr:
-        waveform = torchaudio.functional.resample(waveform, sr, target_sr)
-    return waveform
+_HOP_LENGTH    = 512
+_CHUNK_SECONDS = 300  # decode window; bounds peak audio RAM to one chunk
 
 
 def extract_frame_audio_features(
@@ -47,19 +28,49 @@ def extract_frame_audio_features(
 ) -> np.ndarray:
     """Return an (N, n_mels) log-mel feature — one vector per sampled timestamp.
 
-    The waveform is turned into a log-mel spectrogram over time; each timestamp
-    picks its nearest mel frame, giving one audio feature per video sample.
+    The audio track is decoded in chunks, each turned into a log-mel spectrogram;
+    every timestamp then picks its nearest mel frame.
     """
-    waveform = _load_mono(video_path, sample_rate)
+    if not _AUDIO_AVAILABLE:
+        raise RuntimeError(
+            "Audio branch enabled but torchaudio/torchcodec are not installed. "
+            "Install them (and ffmpeg) or set data.audio.enabled: false."
+        )
+    try:
+        decoder = AudioDecoder(video_path, sample_rate=sample_rate, num_channels=1)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to open audio from {video_path}: {exc}. "
+            "torchcodec audio decode needs ffmpeg; install it, or set "
+            "data.audio.enabled: false."
+        ) from exc
 
-    mel = torchaudio.transforms.MelSpectrogram(
+    mel_transform = torchaudio.transforms.MelSpectrogram(
         sample_rate=sample_rate, n_mels=n_mels, hop_length=_HOP_LENGTH,
-    )(waveform)
-    log_mel = torch.log1p(mel).squeeze(0).transpose(0, 1)  # (frames, n_mels)
+    )
+    duration = float(decoder.metadata.duration_seconds or 0.0)
 
-    frame_times = torch.arange(log_mel.shape[0]) * _HOP_LENGTH / sample_rate
-    features = [
-        log_mel[int(torch.argmin(torch.abs(frame_times - ts)))]
-        for ts in timestamps
-    ]
-    return torch.stack(features).numpy().astype(np.float32)
+    log_mels:    list[torch.Tensor] = []
+    frame_times: list[np.ndarray]   = []
+    start = 0.0
+    while start < duration:
+        stop     = min(start + _CHUNK_SECONDS, duration)
+        waveform = decoder.get_samples_played_in_range(start, stop).data  # (1, n) mono
+        if waveform.shape[1] >= _HOP_LENGTH:
+            mel     = mel_transform(waveform)                         # (1, n_mels, frames)
+            log_mel = torch.log1p(mel).squeeze(0).transpose(0, 1)     # (frames, n_mels)
+            log_mels.append(log_mel)
+            frame_times.append(start + np.arange(log_mel.shape[0]) * _HOP_LENGTH / sample_rate)
+        start = stop
+
+    if not log_mels:
+        raise RuntimeError(f"No audio decoded from {video_path}.")
+
+    features   = torch.cat(log_mels, dim=0).numpy()          # (F, n_mels)
+    times      = np.concatenate(frame_times)                 # (F,) monotonic
+    query      = np.asarray(timestamps, dtype=np.float64)
+
+    nearest    = np.clip(np.searchsorted(times, query), 1, len(times) - 1)
+    take_left  = np.abs(query - times[nearest - 1]) <= np.abs(times[nearest] - query)
+    nearest    = np.where(take_left, nearest - 1, nearest)
+    return features[nearest].astype(np.float32)

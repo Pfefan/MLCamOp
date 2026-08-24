@@ -7,7 +7,7 @@ import torch
 import yaml
 
 from src.data.sampler import (
-    generate_training_data, concert_split, split_dataset, concat_samplesets,
+    generate_training_data, split_dataset, concat_samplesets,
 )
 from src.models.view_classifier import ViewClassifier, _NUM_WORKERS
 from src.utils.logger import setup_logger
@@ -53,6 +53,7 @@ def train_model(config: dict) -> None:
             audio_enabled        = audio_cfg.get("enabled", False),
             audio_sample_rate    = audio_cfg.get("sample_rate", 16000),
             audio_n_mels         = audio_cfg.get("n_mels", 32),
+            cache_id             = concert.get("id"),
         ))
 
     total_frames = sum(len(s) for s in concert_sets)
@@ -69,20 +70,25 @@ def train_model(config: dict) -> None:
             "Using concert-level split: training on concerts 1–%d, validating on concert %d.",
             len(concerts) - 1, len(concerts),
         )
-        train_data, val_data = concert_split(concert_sets, val_concert_idx=-1)
+        # Keep training concerts separate (not concatenated) so their frames stay
+        # memory-mapped instead of materialising into one large anonymous buffer.
+        train_concerts = concert_sets[:-1]
+        val_data       = concert_sets[-1]
     else:
         if force_random:
             logger.info("Using random frame-level split (--random-split diagnostic mode).")
         else:
             logger.info("Single concert: using shuffled 80/20 frame-level split.")
-        train_data, val_data = split_dataset(
+        train_ss, val_data = split_dataset(
             concat_samplesets(concert_sets), val_split=val_split
         )
+        train_concerts = [train_ss]
 
     del concert_sets
     gc.collect()
 
-    logger.info("Split: %d train frames / %d val frames", len(train_data), len(val_data))
+    n_train = sum(len(c) for c in train_concerts)
+    logger.info("Split: %d train frames / %d val frames", n_train, len(val_data))
 
     audio_dim = audio_cfg.get("n_mels", 32) if audio_cfg.get("enabled", False) else 0
     classifier = ViewClassifier(
@@ -97,13 +103,14 @@ def train_model(config: dict) -> None:
     logger.info("Using device: %s", classifier.device)
 
     classifier.train(
-        train_data  = train_data,
-        val_data    = val_data,
-        epochs      = config["training"]["epochs"],
-        batch_size  = batch_size,
-        lr          = config["training"]["learning_rate"],
-        patience    = config["training"].get("patience", 15),
-        num_workers = num_workers,
+        train_concerts = train_concerts,
+        val_data       = val_data,
+        epochs         = config["training"]["epochs"],
+        batch_size     = batch_size,
+        lr             = config["training"]["learning_rate"],
+        patience       = config["training"].get("patience", 15),
+        num_workers    = num_workers,
+        use_compile    = config["training"].get("compile", True),
     )
 
     save_path = config["model"]["checkpoint"]
@@ -145,6 +152,7 @@ def _report_per_concert(config: dict, classifier: ViewClassifier, logger) -> Non
             audio_enabled        = audio_cfg.get("enabled", False),
             audio_sample_rate    = audio_cfg.get("sample_rate", 16000),
             audio_n_mels         = audio_cfg.get("n_mels", 32),
+            cache_id             = concert.get("id"),
         )
         preds = classifier.predict_batch(data.frames, audio=data.audio)
         bal   = balanced_accuracy(data.labels, preds)

@@ -77,6 +77,7 @@ def main(config: dict, concert_index: int = 0, check_split: bool = False) -> Non
             similarity_threshold = suggested,
             cache_dir            = config["data"].get("cache_dir", "data/cache"),
             force_rebuild        = True,   # always re-evaluate at the new threshold
+            cache_id             = concert.get("id"),
         )
         labels = data.labels
         n = len(labels)

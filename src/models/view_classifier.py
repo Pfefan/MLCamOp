@@ -118,19 +118,16 @@ def _degrade_closeup(view: torch.Tensor) -> torch.Tensor:
 
 
 def _augment_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    """Apply augmentation to a 3-ch, 6-ch, or K*6-ch uint8 tensor.
+    """Apply augmentation to a 3-ch or K*6-ch uint8 tensor.
 
     Runs in uint8 pixel space (the conventional domain for these torchvision
-    transforms); ImageNet normalisation happens later on the GPU.  Spatial
-    transforms are applied identically across all channels (so all frames in the
-    temporal window are flipped/affined consistently).  Color transforms are
-    applied independently to each 3-channel camera view, and the close-up half
-    receives extra, harder degradation to break the input↔label pixel identity
-    (see _degrade_closeup).
+    transforms); ImageNet normalisation happens later on the GPU. The spatial
+    transform is shared across all channels (consistent flip/affine over the
+    window); color transforms are applied per camera view, and the close-up half
+    gets extra degradation to break the input↔label pixel identity (_degrade_closeup).
     """
     n_ch = tensor.shape[0]
     if n_ch % 6 == 0:
-        # Apply the same spatial transform to the full (K*6, H, W) tensor
         tensor = _SPATIAL_AUGMENT(tensor)
         K = n_ch // 6
         parts: list[torch.Tensor] = []
@@ -311,18 +308,19 @@ class _DualStreamModel(nn.Module):
 
 
 class _FrameDataset(torch.utils.data.Dataset):
-    """Dataset that stores raw uint8 numpy frames and preprocesses on-the-fly.
+    """Windowed dataset over one or more concerts.
 
-    Frames MUST be passed as a single contiguous np.ndarray of shape
-    (N, H, W, C) — NOT as a list[np.ndarray].  A contiguous array is
-    truly copy-on-write safe across DataLoader workers because indexing
-    returns a view without touching Python reference counts.  A Python
-    list would trigger COW page-copies on every worker access.
+    Each concert's frames are kept as their own contiguous uint8 array (typically
+    memory-mapped from the cache), so training never concatenates concerts into a
+    single large anonymous RAM buffer. Causal temporal windows are built *within*
+    a concert and clamped to its bounds, so a window never bleeds across the join
+    between two different concerts.
 
-    When _TEMPORAL_WINDOW > 1, each sample is a window of K consecutive
-    frame pairs (K*6 channels), centred on the labelled index.  Boundary
-    indices are clamped so the first and last samples are padded by edge
-    repetition.
+    Two construction paths:
+    - ``_FrameDataset(frames, labels, ...)`` — a single concert (used by tests);
+      yields ``(window, label)`` unless weights/audio are supplied.
+    - ``_FrameDataset.from_concerts([SampleSet, ...], ...)`` — multiple concerts;
+      always yields ``(window, label, weight, audio)``.
     """
 
     def __init__(
@@ -335,41 +333,63 @@ class _FrameDataset(torch.utils.data.Dataset):
         weights: list[float] | None = None,
         audio: np.ndarray | None = None,
     ):
-        if not isinstance(frames, np.ndarray):
-            frames = np.asarray(frames)
-        self.frames    = frames
-        self.labels    = labels
         self.augment   = augment
         self.window    = window
         self.lookahead = lookahead
-        self.weights   = weights
-        self.audio     = audio
+        if not isinstance(frames, np.ndarray):
+            frames = np.asarray(frames)
+        self._concerts    = [(frames, labels, weights, audio)]
+        self._legacy_pair = weights is None and audio is None
+        self._build_index()
+
+    @classmethod
+    def from_concerts(cls, concerts: list, augment: bool, window: int, lookahead: int) -> "_FrameDataset":
+        self = cls.__new__(cls)
+        self.augment   = augment
+        self.window    = window
+        self.lookahead = lookahead
+        self._concerts = [(c.frames, c.labels, c.weights, c.audio) for c in concerts]
+        self._legacy_pair = False
+        self._build_index()
+        return self
+
+    def _build_index(self) -> None:
+        self._index = [
+            (ci, li)
+            for ci, (frames, *_rest) in enumerate(self._concerts)
+            for li in range(len(frames))
+        ]
 
     def __len__(self) -> int:
-        return len(self.frames)
+        return len(self._index)
 
-    def __getitem__(self, idx: int):
-        tensor = self._build_window(idx)
+    def __getitem__(self, gidx: int):
+        ci, li = self._index[gidx]
+        frames, labels, weights, audio = self._concerts[ci]
+
+        tensor = self._build_window(frames, li)
         if self.augment:
             tensor = _augment_tensor(tensor)
-        if self.weights is None and self.audio is None:
-            return tensor, self.labels[idx]
-        weight = self.weights[idx] if self.weights is not None else 1.0
-        audio  = self._audio_window(idx) if self.audio is not None else torch.zeros(0)
-        return tensor, self.labels[idx], weight, audio
 
-    def _audio_window(self, idx: int) -> torch.Tensor:
+        if self._legacy_pair:
+            return tensor, labels[li]
+
+        weight     = weights[li] if weights is not None else 1.0
+        audio_win  = self._audio_window(audio, li) if audio is not None else torch.zeros(0)
+        return tensor, labels[li], weight, audio_win
+
+    def _audio_window(self, audio: np.ndarray, li: int) -> torch.Tensor:
         """Per-frame audio features for the same causal window as the visual frames."""
-        indices = _causal_window_indices(idx, len(self.frames), self.window, self.lookahead)
-        return torch.from_numpy(self.audio[indices]).float()  # (window, n_mels)
+        indices = _causal_window_indices(li, len(audio), self.window, self.lookahead)
+        return torch.from_numpy(audio[indices]).float()  # (window, n_mels)
 
-    def _build_window(self, idx: int) -> torch.Tensor:
-        """Return the causal window at *idx* as a (window*6, H, W) uint8 tensor.
+    def _build_window(self, frames: np.ndarray, li: int) -> torch.Tensor:
+        """Return the causal window at *li* within *frames* as a (window*6, H, W) uint8 tensor.
 
         Kept as uint8 — normalisation is deferred to the GPU (_normalize_windows).
         """
-        indices = _causal_window_indices(idx, len(self.frames), self.window, self.lookahead)
-        return torch.cat([_frame_to_uint8_chw(self.frames[j]) for j in indices], dim=0)
+        indices = _causal_window_indices(li, len(frames), self.window, self.lookahead)
+        return torch.cat([_frame_to_uint8_chw(frames[j]) for j in indices], dim=0)
 
 
 def _make_class_weights(labels: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -439,24 +459,30 @@ class ViewClassifier:
 
     def train(
         self,
-        train_data:  "SampleSet",
-        val_data:    "SampleSet",
+        train_concerts: list,
+        val_data:       "SampleSet",
         epochs:       int   = 40,
         batch_size:   int   = 32,
         lr:           float = 3e-4,
         patience:     int   = 15,
         num_workers:  int   = _NUM_WORKERS,
+        use_compile:  bool  = True,
     ) -> None:
-        """Fine-tune with mixed-precision, early stopping on balanced accuracy."""
-        train_frames, train_labels = train_data.frames, train_data.labels
-        val_frames,   val_labels   = val_data.frames,   val_data.labels
+        """Fine-tune with mixed-precision, early stopping on balanced accuracy.
 
-        train_ds = _FrameDataset(train_frames, train_labels, augment=True,
-                                 window=self.window, lookahead=self.lookahead,
-                                 weights=train_data.weights, audio=train_data.audio)
-        val_ds   = _FrameDataset(val_frames,   val_labels,   augment=False,
-                                 window=self.window, lookahead=self.lookahead,
-                                 weights=val_data.weights, audio=val_data.audio)
+        `train_concerts` is a list of SampleSets kept separate (never concatenated)
+        so their frames stay memory-mapped; `val_data` is the single held-out concert.
+        """
+        train_labels = [l for c in train_concerts for l in c.labels]
+        n_train      = sum(len(c.frames) for c in train_concerts)
+        n_val        = len(val_data.frames)
+
+        train_ds = _FrameDataset.from_concerts(
+            train_concerts, augment=True, window=self.window, lookahead=self.lookahead,
+        )
+        val_ds   = _FrameDataset.from_concerts(
+            [val_data], augment=False, window=self.window, lookahead=self.lookahead,
+        )
 
         # pin_memory speeds up CPU→GPU transfers but requires extra page-locked
         # RAM.  Disable it when workers=0 (no async prefetch anyway) or when
@@ -475,9 +501,11 @@ class ViewClassifier:
 
         # torch.compile (#2): fuse kernels for a CUDA speedup.  Wrap a SEPARATE
         # handle so self.model stays an eager module (clean state_dict keys for
-        # save/load).  Skipped on CPU and disablable via MLCAMOP_NO_COMPILE=1.
+        # save/load).  Controlled by config (training.compile); MLCAMOP_NO_COMPILE=1
+        # is a hard override that always disables it.
         self._model_fwd = self.model
-        if self.device.type == "cuda" and os.environ.get("MLCAMOP_NO_COMPILE") != "1":
+        env_disabled = os.environ.get("MLCAMOP_NO_COMPILE") == "1"
+        if self.device.type == "cuda" and use_compile and not env_disabled:
             try:
                 self._model_fwd = torch.compile(self.model)
                 print("torch.compile: enabled")
@@ -543,7 +571,7 @@ class ViewClassifier:
         n_trainable = sum(p.numel() for g in optimizer.param_groups for p in g["params"])
         n_head = sum(p.numel() for p in head_params)
         counts = torch.bincount(y_train)
-        print(f"Training on {len(train_frames)} | Validating on {len(val_frames)}")
+        print(f"Training on {n_train} | Validating on {n_val}")
         print(f"Trainable parameters: {n_trainable:,}  (backbone: {n_trainable - n_head:,} | head: {n_head:,})")
         print(f"Param groups: {' | '.join(f'{sum(p.numel() for p in g['params']):,} @ lr={g['lr']:.2e}' for g in optimizer.param_groups)}")
         print(f"Train class counts — wide: {counts[0].item()}  close-up: {counts[1].item()}")

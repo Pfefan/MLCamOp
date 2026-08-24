@@ -43,6 +43,7 @@ def evaluate(config: dict) -> None:
             audio_enabled        = audio_cfg.get("enabled", False),
             audio_sample_rate    = audio_cfg.get("sample_rate", 16000),
             audio_n_mels         = audio_cfg.get("n_mels", 32),
+            cache_id             = concert.get("id"),
         ))
 
     if not any(len(s) > 0 for s in concert_sets):

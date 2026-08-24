@@ -12,33 +12,38 @@
 # ─────────────────────────────────────────────────────────────────────────────
 data:
   concerts:
-    - total_view:          "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/totalle_StadtkapelleWeiz_20251116_00004162.mp4"
+    - id:                  stadtkapelle_weiz
+      total_view:          "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/totalle_StadtkapelleWeiz_20251116_00004162.mp4"
       closeup:             "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/closeup_StadtkapelleWeiz_20251116_00004162.mp4"
       result:              "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/schnitt_StadtkapelleWeiz_20251116_00000000.mp4"
       similarity_threshold: 31.1
 
-    - total_view:          "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/totalle.mp4"
+    - id:                  kasernenfest
+      total_view:          "/mnt/Data/Job/Projekte/CutStudio/07_KsLiveKasernenfestjuli2026/KsLiveKasernenfest_totalle.mp4"
+      closeup:             "/mnt/Data/Job/Projekte/CutStudio/07_KsLiveKasernenfestjuli2026/KsLiveKasernenfest_closeup.mp4"
+      result:              "/mnt/Data/Job/Projekte/CutStudio/07_KsLiveKasernenfestjuli2026/KsLiveKasernenfest_schnitt.mp4"
+      similarity_threshold: 15.1
+
+    - id:                  triotronik_messe
+      total_view:          "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/totalle.mp4"
       closeup:             "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/closeup.mp4"
       result:              "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/rec.mp4"
       similarity_threshold: 42.5
 
-    - total_view:          "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/TOTALLE_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
+    - id:                  ubahnorchester
+      total_view:          "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/TOTALLE_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
       closeup:             "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/CLOSEUP_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
       result:              "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/SCHNITT_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
       similarity_threshold: 25.4
 
     # Add future concerts here, e.g.:
-    # - total_view:          "E:/Job/Projekte/CutStudio/05_SomeConcert/TOTALLE.mp4"
+    # - id:                  some_concert
+    #   total_view:          "E:/Job/Projekte/CutStudio/05_SomeConcert/TOTALLE.mp4"
     #   closeup:             "E:/Job/Projekte/CutStudio/05_SomeConcert/CLOSEUP.mp4"
     #   result:              "E:/Job/Projekte/CutStudio/05_SomeConcert/SCHNITT.mp4"
     #   similarity_threshold: 39  # TODO: run tune_threshold.py --concert N
 
-  # Frames per second to sample from video.
-  # This is the single biggest RAM knob — halving it halves dataset size:
-  #   2.0 fps × 3 concerts ≈ 19 GB  (requires ~24 GB free RAM)
-  #   1.0 fps × 3 concerts ≈  9 GB  (fits on 12 GB free RAM)
-  #   0.5 fps × 3 concerts ≈  5 GB  (fits on 8 GB free RAM)
-  # Changing this invalidates the cache and forces a full re-sample.
+
   sample_fps: 2.0
 
   # Preprocessed frame cache — avoids re-reading videos on every run.
@@ -72,7 +77,12 @@ training:
   val_split:     0.2
   patience:      8
 
-  num_workers: 4
+  num_workers: 12
+
+  # torch.compile the model. Adds a ~15 min one-time warmup and helps only when the
+  # GPU is the bottleneck. This pipeline is CPU-bound, so leave it off unless the
+  # GPU is clearly saturated. (MLCAMOP_NO_COMPILE=1 always disables it.)
+  compile: false
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model
