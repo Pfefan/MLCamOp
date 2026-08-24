@@ -1,13 +1,4 @@
-"""Tune the similarity_threshold for labelling wide vs close-up frames.
-
-Each concert can have its own threshold. Run once per concert and set the
-suggested value in the corresponding field in model_config.yaml.
-
-Usage::
-
-    python scripts/tune_threshold.py --config configs/model_config.yaml
-    python scripts/tune_threshold.py --config configs/model_config.yaml --concert 1 --check-split
-"""
+"""Tune the per-concert similarity threshold."""
 
 import argparse
 
@@ -17,7 +8,7 @@ from src.data.sampler import compute_similarity_stats, generate_training_data
 
 
 def main(config: dict, concert_index: int = 0, check_split: bool = False) -> None:
-    """Print similarity stats for one concert and suggest a threshold."""
+    """Print similarity stats and suggest a threshold."""
     concerts = config["data"]["concerts"]
     if concert_index >= len(concerts):
         raise IndexError(
@@ -48,10 +39,8 @@ def main(config: dict, concert_index: int = 0, check_split: bool = False) -> Non
             print(f"  {k:>5}: {v:.2f}")
         print()
 
-    # A good threshold sits between the median of the two distributions
     suggested = (stats["total"]["p50"] + stats["closeup"]["p50"]) / 2.0
 
-    # Warn if the two distributions are identical — usually means a path problem
     if abs(stats["total"]["p50"] - stats["closeup"]["p50"]) < 0.01:
         print("⚠️  WARNING: result↔total_view and result↔closeup distributions are")
         print("   identical. This usually means both video paths point to the same file.")
@@ -67,7 +56,6 @@ def main(config: dict, concert_index: int = 0, check_split: bool = False) -> Non
     print(f"  similarity_threshold: {suggested:.1f}")
 
     if check_split:
-        # Full video sampling — slow but confirms the threshold is sensible
         print(f"\nChecking label split at threshold={suggested:.1f} (this may take a few minutes)...")
         data = generate_training_data(
             total_view_path      = total_view,

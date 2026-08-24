@@ -1,17 +1,4 @@
-"""Preview: produce a cut video from a single wide-shot using the trained model.
-
-A digital zoom simulates the close-up camera unless a real close-up is provided.
-
-Usage::
-
-    python scripts/preview.py --config configs/model_config.yaml \\
-        --input "path/to/total_view.mp4" --output "output/preview.mp4"
-
-    # With a real close-up camera:
-    python scripts/preview.py --config configs/model_config.yaml \\
-        --input "path/to/total_view.mp4" --closeup "path/to/closeup.mp4" \\
-        --output "output/preview.mp4"
-"""
+"""Preview a cut using the trained model."""
 
 import argparse
 import os
@@ -21,7 +8,6 @@ import cv2
 import numpy as np
 import yaml
 
-# Make sure the project root is on the path when running from any directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.models.view_classifier import ViewClassifier
@@ -36,12 +22,8 @@ except ImportError:
     _TQDM = False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Frame reading helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _read_all_frames(path: str, desc: str) -> tuple[list[np.ndarray], float]:
-    """Read every frame from *path* into memory and return (frames, fps)."""
+    """Read a video fully into memory."""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {path}")
@@ -68,7 +50,7 @@ def _read_frames_at_timestamps(
     fps:        float,
     desc:       str,
 ) -> list[np.ndarray]:
-    """Seek-based frame reader: extract frames at the given timestamps (seconds)."""
+    """Read frames at specific timestamps."""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {path}")
@@ -91,22 +73,17 @@ def _read_frames_at_timestamps(
 
 
 def _simulate_closeup(frame: np.ndarray, crop_factor: float) -> np.ndarray:
-    """Centre-crop then upscale to simulate a close-up (digital zoom)."""
+    """Simulate a close-up by centre-cropping and scaling up."""
     h, w = frame.shape[:2]
     crop_h = int(h * crop_factor)
     crop_w = int(w * crop_factor)
 
-    # Centre the crop
     y0 = (h - crop_h) // 2
     x0 = (w - crop_w) // 2
 
     cropped = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
     return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main pipeline
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_preview(
     total_view_path: str,
@@ -117,7 +94,7 @@ def run_preview(
     closeup_path:    str | None = None,
     min_shot_sec:    float      = 0.5,
 ) -> None:
-    """Classify, assemble, and render a preview cut from a wide-shot video."""
+    """Classify shots and render a preview cut."""
     print(f"Loading model from {checkpoint} ...")
     classifier = ViewClassifier()
     classifier.load(checkpoint)
@@ -176,10 +153,6 @@ def run_preview(
     render_video(output_frames, output_path, fps=sample_fps)
     print(f"Done.  Output written to: {output_path}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

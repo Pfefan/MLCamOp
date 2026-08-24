@@ -1,10 +1,4 @@
-"""End-to-end inference: classify shots in a concert and render the output video.
-
-Usage::
-
-    python scripts/run_pipeline.py --config configs/model_config.yaml --output output/result.mp4
-    python scripts/run_pipeline.py --config configs/model_config.yaml --concert 1 --output output/result.mp4
-"""
+"""Run end-to-end inference and render the edited output."""
 
 import argparse
 import os
@@ -25,7 +19,7 @@ def _read_frames_at_timestamps(
     timestamps: list[float],
     fps:        float,
 ) -> list[np.ndarray]:
-    """Seek-based frame reader: extract frames at the given timestamps (seconds)."""
+    """Read frames at the given timestamps."""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {path}")
@@ -45,7 +39,7 @@ def _read_frames_at_timestamps(
 
 
 def run_pipeline(config: dict, output_path: str, concert_index: int = 0) -> None:
-    """Load model, classify frames, assemble cut, and render the output video."""
+    """Load the model, classify frames, and render the output."""
     logger = setup_logger(config["logging"]["log_file"], config["logging"].get("level", "INFO"))
 
     concerts = config["data"]["concerts"]
@@ -88,7 +82,6 @@ def run_pipeline(config: dict, output_path: str, concert_index: int = 0) -> None
         n_closeup, n_closeup / len(labels) * 100,
     )
 
-    # Get source FPS for frame-index conversion
     cap = cv2.VideoCapture(total_view_path)
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     cap.release()
@@ -99,7 +92,6 @@ def run_pipeline(config: dict, output_path: str, concert_index: int = 0) -> None
     logger.info("Reading close-up frames at sample timestamps ...")
     closeup_frames = _read_frames_at_timestamps(closeup_path, timestamps, video_fps)
 
-    # Minimum shot length: 0.5 s expressed in sample units
     min_shot_frames = max(1, int(0.5 * sample_fps))
     logger.info("Assembling cut (min shot = %d samples) ...", min_shot_frames)
     output_frames = assemble_cut(total_frames, closeup_frames, labels, min_shot_frames)

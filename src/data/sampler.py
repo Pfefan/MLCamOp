@@ -1,11 +1,4 @@
-"""Generate labelled training data by comparing total_view and closeup video frames.
-
-Labeling: for each sampled timestamp, compare the human-edited result video against
-both the wide and closeup cameras. Whichever matches (pixel diff < threshold) becomes
-the label. Ambiguous frames (both or neither match) are skipped.
-
-Frames are cached to disk (keyed by paths + settings) so reruns load in seconds.
-"""
+"""Generate labelled training data from the wide, close-up, and result videos."""
 
 import hashlib
 import logging
@@ -27,12 +20,8 @@ except ImportError:
 
 logger = logging.getLogger("ConcertVideoEditor")
 
-# Thumbnail size for pixel-diff comparisons (labeling only — never stored)
 _THUMB_W, _THUMB_H = 160, 90
-
-# Frames are resized to this before caching and training.
-# Matches MobileNetV3 input size: 3900 frames × 224×224×3 ≈ 590 MB vs ~24 GB at 1080p.
-_STORE_SIZE = (224, 224)  # (width, height) for cv2.resize
+_STORE_SIZE = (224, 224)
 
 
 @dataclass
@@ -53,10 +42,6 @@ class SampleSet:
     def __len__(self) -> int:
         return len(self.frames)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Low-level helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _thumb(frame: np.ndarray) -> np.ndarray:
     """Resize frame to thumbnail and convert to float32."""
@@ -82,10 +67,6 @@ def _cache_key(total_view_path: str, closeup_path: str, result_path: str,
     return hashlib.md5(payload.encode()).hexdigest()[:12]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API
-# ─────────────────────────────────────────────────────────────────────────────
-
 def compute_similarity_stats(
     total_view_path: str,
     closeup_path:    str,
@@ -93,24 +74,21 @@ def compute_similarity_stats(
     sample_fps:      float = 1.0,
     n_samples:       int   = 200,
 ) -> dict:
-    """Sample frames and compute pixel-diff statistics for threshold tuning."""
+    """Sample frames and compute diff statistics for threshold tuning."""
     cap_total   = _open_video(total_view_path)
     cap_closeup = _open_video(closeup_path)
     cap_result  = _open_video(result_path)
 
-    video_fps    = cap_total.get(cv2.CAP_PROP_FPS) or 25.0
-    total_frames = int(cap_total.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_fps      = cap_total.get(cv2.CAP_PROP_FPS) or 25.0
+    total_frames   = int(cap_total.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_interval = max(1, int(video_fps / sample_fps))
 
-    # Sample evenly across the video rather than randomly to avoid clustering
     sample_indices = list(range(0, total_frames, frame_interval))[:n_samples]
-    last_sample    = sample_indices[-1] if sample_indices else 0
+    last_sample = sample_indices[-1] if sample_indices else 0
 
-    diffs_total:   list[float] = []
+    diffs_total: list[float] = []
     diffs_closeup: list[float] = []
 
-    # Sequential decode (grab all, retrieve only at sample points) — far faster
-    # than seeking to each sample.
     idx = 0
     while idx <= last_sample:
         if not (cap_total.grab() and cap_closeup.grab() and cap_result.grab()):
@@ -161,23 +139,13 @@ def generate_training_data(
     audio_n_mels:         int   = 32,
     cache_id:             str | None = None,
 ) -> SampleSet:
-    """Build a labelled SampleSet from three synchronised concert videos.
-
-    Frames are wide+closeup stacked as 6-channel (224×224×6) when dual_frame=True,
-    else total_view only. Each frame is labelled by whichever camera the edited
-    result matches. Ambiguous transition frames (fades/dissolves) are kept when
-    keep_transitions=True with a lower `transition_weight`, so the model sees real
-    cut moments instead of only clean steady state. Results are cached to disk.
-    """
+    """Build a labelled sample set from the three concert videos."""
     os.makedirs(cache_dir, exist_ok=True)
     key_parts = ["dual" if dual_frame else "single"]
     if keep_transitions:
         key_parts.append(f"tr{transition_weight}")
     if audio_enabled:
         key_parts.append(f"aud{audio_sample_rate}x{audio_n_mels}")
-    # A stable per-concert `cache_id` makes the cache filename independent of the
-    # (machine-specific) video paths, so caches are portable between systems.
-    # Without one, fall back to hashing the paths (legacy behaviour).
     if cache_id:
         settings = hashlib.md5(f"{sample_fps}|{similarity_threshold}".encode()).hexdigest()[:6]
         base = f"{cache_id}_{settings}"
@@ -189,18 +157,11 @@ def generate_training_data(
 
     if not force_rebuild and cache_path.exists():
         logger.info("Loading cached training data from %s", cache_path)
-        # mmap=True: only pages accessed are loaded from disk — the full
-        # cache file is NOT read into RAM upfront.  Saves ~19 GB of initial
-        # allocation when loading; the OS will page in frames on demand.
         try:
             data = torch.load(str(cache_path), weights_only=False, mmap=True)
         except TypeError:
-            # mmap kwarg requires PyTorch >= 2.0; fall back gracefully
             data = torch.load(str(cache_path), weights_only=False)
 
-        # Support both old (list-of-tensors) and new (stacked tensor) formats.
-        # Always return a single contiguous ndarray (N, H, W, C) — NOT a
-        # list — so _FrameDataset is COW-safe across DataLoader workers.
         raw = data["frames"]
         if isinstance(raw, list):
             cached_frames = np.stack([f.numpy() for f in raw])
@@ -214,7 +175,6 @@ def generate_training_data(
         _print_label_summary(labels)
         return SampleSet(cached_frames, labels, weights, audio)
 
-    # ── Video reading ────────────────────────────────────────────────────────
     cap_total   = _open_video(total_view_path)
     cap_closeup = _open_video(closeup_path)
     cap_result  = _open_video(result_path)
@@ -245,10 +205,6 @@ def generate_training_data(
             audio_n_mels,
         )
 
-    # Pre-allocated frame buffer (upper bound = every sample kept). Filling in
-    # place and saving a [:count] view avoids the full-size np.stack() copy that
-    # doubled peak RAM at save time. np.empty pages are only committed on write,
-    # so unused tail rows cost nothing.
     store_w, store_h = _STORE_SIZE
     n_channels = 6 if dual_frame else 3
     frame_buf = np.empty((len(sample_indices), store_h, store_w, n_channels), dtype=np.uint8)

@@ -1,11 +1,11 @@
-"""Logging setup for the concert video editor."""
+"""Minimal logger setup."""
 
 import logging
 import os
 
 
 def setup_logger(log_file: str = "logs/app.log", level: str = "INFO") -> logging.Logger:
-    """Create a logger writing to both file and console. Console uses *level*."""
+    """Create a logger that writes to both file and console."""
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
 
     logger = logging.getLogger("ConcertVideoEditor")

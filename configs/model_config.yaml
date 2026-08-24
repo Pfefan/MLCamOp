@@ -1,122 +1,68 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# Video paths
-#
-# Add more concerts to the list as you record them.  Each entry needs the three
-# simultaneous recordings: wide shot (total_view), close-up camera (closeup),
-# and the human-edited final cut (result).
-#
-# The sampler builds a separate cache file per concert (keyed by path + settings)
-# so adding a new concert never invalidates existing caches — it just adds one
-# new cache file.  Set force_rebuild: true only if you change sample_fps or
-# similarity_threshold.
-# ─────────────────────────────────────────────────────────────────────────────
 data:
   concerts:
-    - id:                  stadtkapelle_weiz
-      total_view:          "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/totalle_StadtkapelleWeiz_20251116_00004162.mp4"
-      closeup:             "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/closeup_StadtkapelleWeiz_20251116_00004162.mp4"
-      result:              "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/schnitt_StadtkapelleWeiz_20251116_00000000.mp4"
+    - id: stadtkapelle_weiz
+      total_view: "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/totalle_StadtkapelleWeiz_20251116_00004162.mp4"
+      closeup: "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/closeup_StadtkapelleWeiz_20251116_00004162.mp4"
+      result: "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/schnitt_StadtkapelleWeiz_20251116_00000000.mp4"
       similarity_threshold: 31.1
 
-    - id:                  kasernenfest
-      total_view:          "/mnt/Data/Job/Projekte/CutStudio/07_KsLiveKasernenfestjuli2026/KsLiveKasernenfest_totalle.mp4"
-      closeup:             "/mnt/Data/Job/Projekte/CutStudio/07_KsLiveKasernenfestjuli2026/KsLiveKasernenfest_closeup.mp4"
-      result:              "/mnt/Data/Job/Projekte/CutStudio/07_KsLiveKasernenfestjuli2026/KsLiveKasernenfest_schnitt.mp4"
+    - id: kasernenfest
+      total_view: "/mnt/Data/Job/Projekte/CutStudio/07_KsLiveKasernenfestjuli2026/KsLiveKasernenfest_totalle.mp4"
+      closeup: "/mnt/Data/Job/Projekte/CutStudio/07_KsLiveKasernenfestjuli2026/KsLiveKasernenfest_closeup.mp4"
+      result: "/mnt/Data/Job/Projekte/CutStudio/07_KsLiveKasernenfestjuli2026/KsLiveKasernenfest_schnitt.mp4"
       similarity_threshold: 15.1
 
-    - id:                  triotronik_messe
-      total_view:          "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/totalle.mp4"
-      closeup:             "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/closeup.mp4"
-      result:              "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/rec.mp4"
+    - id: triotronik_messe
+      total_view: "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/totalle.mp4"
+      closeup: "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/closeup.mp4"
+      result: "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/rec.mp4"
       similarity_threshold: 42.5
 
-    - id:                  ubahnorchester
-      total_view:          "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/TOTALLE_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
-      closeup:             "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/CLOSEUP_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
-      result:              "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/SCHNITT_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
+    - id: ubahnorchester
+      total_view: "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/TOTALLE_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
+      closeup: "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/CLOSEUP_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
+      result: "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/SCHNITT_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
       similarity_threshold: 25.4
 
-    # Add future concerts here, e.g.:
-    # - id:                  some_concert
-    #   total_view:          "E:/Job/Projekte/CutStudio/05_SomeConcert/TOTALLE.mp4"
-    #   closeup:             "E:/Job/Projekte/CutStudio/05_SomeConcert/CLOSEUP.mp4"
-    #   result:              "E:/Job/Projekte/CutStudio/05_SomeConcert/SCHNITT.mp4"
-    #   similarity_threshold: 39  # TODO: run tune_threshold.py --concert N
-
-
   sample_fps: 2.0
-
-  # Preprocessed frame cache — avoids re-reading videos on every run.
-  cache_dir:    "data/cache"
+  cache_dir: "data/cache"
   force_rebuild: false
-
-  # Stack wide + close-up as a 6-channel dual frame. Must match the checkpoint.
   dual_frame: true
 
-  # Keep transition frames (fades/dissolves) instead of dropping them, so the
-  # model sees real cut moments. They get a hard nearest-camera label but a lower
-  # training weight (transition_weight) — a soft/uncertain target, still 2-class.
   labeling:
-    keep_transitions:  true
+    keep_transitions: true
     transition_weight: 0.3
 
-  # Audio branch (log-mel features late-fused into the temporal GRU).
-  # Disabled by default: enabling requires torchaudio decode (torchcodec+ffmpeg).
   audio:
     enabled: true
     sample_rate: 16000
     n_mels: 32
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Training hyperparameters
-# ─────────────────────────────────────────────────────────────────────────────
 training:
-  epochs:        60
-  batch_size:    128
-  learning_rate: 0.0005      # head LR; backbone gets lr/10 and lr/100
-  val_split:     0.2
-  patience:      8
-
+  epochs: 60
+  batch_size: 128
+  learning_rate: 0.0005
+  val_split: 0.2
+  patience: 8
   num_workers: 12
-
-  # torch.compile the model. Adds a ~15 min one-time warmup and helps only when the
-  # GPU is the bottleneck. This pipeline is CPU-bound, so leave it off unless the
-  # GPU is clearly saturated. (MLCAMOP_NO_COMPILE=1 always disables it.)
   compile: false
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Model
-# ─────────────────────────────────────────────────────────────────────────────
 model:
-  name:        ViewClassifier
-  backbone:    mobilenet_v3_small
+  name: ViewClassifier
+  backbone: mobilenet_v3_small
   num_classes: 2
-  input_size:  [224, 224]
-  checkpoint:  "models/view_classifier.pt"
+  input_size: [224, 224]
+  checkpoint: "models/view_classifier.pt"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Temporal model
-#
-# The dual-stream comparison features are run through a GRU over a causal window
-# so cut decisions use recent context instead of a single frame. The window is
-# past-heavy with a small bounded lookahead, keeping it compatible with streaming
-# / live inference (only `lookahead` future frames are ever required).
-# ─────────────────────────────────────────────────────────────────────────────
 temporal:
-  window:     5    # frames per sample fed to the GRU
-  lookahead:  1    # future frames in the window (rest are past); 0 = fully causal
-  rnn_hidden: 128  # GRU hidden size
+  window: 5
+  lookahead: 1
+  rnn_hidden: 128
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Evaluation
-# ─────────────────────────────────────────────────────────────────────────────
 evaluation:
-  cut_tolerance_sec: 0.4  # ± window for matching predicted cut events to ground truth
+  cut_tolerance_sec: 0.4
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
 logging:
   log_file: "logs/training.log"
-  level:    INFO
+  level: INFO
 

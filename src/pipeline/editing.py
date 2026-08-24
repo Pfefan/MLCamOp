@@ -24,8 +24,6 @@ def assemble_cut(
     return result
 
 
-# ── Private helpers ───────────────────────────────────────────────────────────
-
 def _enforce_min_shot_length(labels: list[int], min_frames: int) -> list[int]:
     """Suppress label runs shorter than *min_frames* by merging with previous."""
     if not labels or min_frames <= 1:

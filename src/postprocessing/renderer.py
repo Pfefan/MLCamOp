@@ -1,4 +1,4 @@
-"""Render an assembled frame sequence to an MP4 file."""
+"""Render a frame sequence to MP4."""
 
 import cv2
 import numpy as np

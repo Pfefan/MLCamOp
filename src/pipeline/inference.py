@@ -1,10 +1,4 @@
-"""Streaming ViewClassifier inference over a video (or dual-camera) source.
-
-Frames are decoded sequentially and held only in a bounded ring buffer sized to
-the classifier's causal temporal window, so memory does not grow with video
-length and no code path depends on more than `classifier.lookahead` future
-frames — keeping this compatible with live / real-time use.
-"""
+"""Streaming inference over a video or dual-camera source."""
 
 from collections import deque
 
@@ -16,7 +10,7 @@ from src.models.view_classifier import ViewClassifier, _causal_window_indices
 
 
 def _pad_window(frames: list[np.ndarray], window: int) -> list[np.ndarray]:
-    """Left-pad a short buffer to `window` frames by repeating the oldest frame."""
+    """Left-pad a short buffer to the expected window size."""
     if len(frames) < window:
         frames = [frames[0]] * (window - len(frames)) + frames
     return frames
@@ -28,14 +22,7 @@ def classify_video(
     sample_fps:      float = 1.0,
     closeup_path:    str | None = None,
 ) -> list[tuple[float, int]]:
-    """Classify sampled frames, returning (timestamp, label) pairs in order.
-
-    If closeup_path is given, both cameras are decoded in lockstep and stacked as
-    6-channel dual frames. Decoding is sequential (grab/retrieve) and streaming:
-    only the last `window` sampled frames are kept in memory. When the model has
-    an audio branch, per-sample log-mel features are precomputed (tiny) and windowed
-    causally alongside the frames.
-    """
+    """Classify sampled frames and return (timestamp, label) pairs."""
     cap_total = cv2.VideoCapture(total_view_path)
     if not cap_total.isOpened():
         raise ValueError(f"Cannot open video: {total_view_path}")
@@ -95,8 +82,6 @@ def classify_video(
             frame_buf.append(frame)
             timestamps.append(idx / video_fps)
 
-            # Decision for sampled index `sampled - lookahead` is ready once its
-            # bounded lookahead of future frames has been buffered.
             if sampled >= lookahead:
                 t = sampled - lookahead
                 preds.append(classifier.predict_window(
@@ -112,8 +97,6 @@ def classify_video(
     if not timestamps:
         return []
 
-    # Flush the final `lookahead` decisions, clamping the missing future frames
-    # to the last available frame (matching training's edge-clamped window).
     buf_list = list(frame_buf)
     last     = buf_list[-1]
     for d in range(1, lookahead + 1):

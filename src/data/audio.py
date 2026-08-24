@@ -1,10 +1,4 @@
-"""Per-frame audio features (log-mel) aligned to sampled video timestamps.
-
-Decoding streams the audio track in fixed-duration chunks (resampled and
-downmixed to mono on decode), so peak memory stays flat regardless of video
-length — a multi-hour concert never loads its whole waveform into RAM. The mel
-transform itself is pure torch.
-"""
+"""Audio features aligned to sampled video timestamps."""
 
 import numpy as np
 import torch
@@ -17,7 +11,7 @@ except ImportError:
     _AUDIO_AVAILABLE = False
 
 _HOP_LENGTH    = 512
-_CHUNK_SECONDS = 300  # decode window; bounds peak audio RAM to one chunk
+_CHUNK_SECONDS = 300
 
 
 def extract_frame_audio_features(
@@ -26,11 +20,7 @@ def extract_frame_audio_features(
     sample_rate: int = 16000,
     n_mels:      int = 32,
 ) -> np.ndarray:
-    """Return an (N, n_mels) log-mel feature — one vector per sampled timestamp.
-
-    The audio track is decoded in chunks, each turned into a log-mel spectrogram;
-    every timestamp then picks its nearest mel frame.
-    """
+    """Return one log-mel feature vector per sampled timestamp."""
     if not _AUDIO_AVAILABLE:
         raise RuntimeError(
             "Audio branch enabled but torchaudio/torchcodec are not installed. "
@@ -55,10 +45,10 @@ def extract_frame_audio_features(
     start = 0.0
     while start < duration:
         stop     = min(start + _CHUNK_SECONDS, duration)
-        waveform = decoder.get_samples_played_in_range(start, stop).data  # (1, n) mono
+        waveform = decoder.get_samples_played_in_range(start, stop).data
         if waveform.shape[1] >= _HOP_LENGTH:
-            mel     = mel_transform(waveform)                         # (1, n_mels, frames)
-            log_mel = torch.log1p(mel).squeeze(0).transpose(0, 1)     # (frames, n_mels)
+            mel = mel_transform(waveform)
+            log_mel = torch.log1p(mel).squeeze(0).transpose(0, 1)
             log_mels.append(log_mel)
             frame_times.append(start + np.arange(log_mel.shape[0]) * _HOP_LENGTH / sample_rate)
         start = stop

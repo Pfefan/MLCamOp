@@ -1,11 +1,4 @@
-"""CNN-based binary classifier: wide shot (0) vs close-up (1) per frame.
-
-MobileNetV3-Small pretrained on ImageNet, fine-tuned on concert footage with:
-- Differential learning rates (backbone lr/10..lr/100, head lr)
-- Inverse-frequency class weights in CrossEntropyLoss
-- Balanced accuracy as early-stopping metric
-- On-the-fly augmentation, AMP, cosine LR, gradient clipping
-"""
+"""Wide-vs-close-up frame classifier."""
 
 import os
 from typing import Optional, TYPE_CHECKING
@@ -29,33 +22,20 @@ try:
 except ImportError:
     _TQDM_AVAILABLE = False
 
-# ImageNet normalisation constants (MobileNetV3 expects these)
 _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-_IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-_INPUT_SIZE    = (224, 224)
-
-# DataLoader workers.  Each worker is a forked process; a single contiguous
-# np.ndarray of shape (N,H,W,C) is truly COW-shared (index reads don't touch
-# Python refcounts).  A Python list[np.ndarray] is NOT COW-safe — refcount
-# updates on each list element trigger page copies, effectively duplicating the
-# dataset per worker.  Keep workers low on RAM-constrained systems.
+_IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+_INPUT_SIZE = (224, 224)
 _NUM_WORKERS = 2
-
-# Temporal sliding window defaults (overridable per ViewClassifier from config).
-# Each sample is a window of K consecutive frame pairs. The window is causal:
-# past-heavy with a small bounded lookahead, so the same code path works for
-# streaming / live inference (only _LOOKAHEAD future frames are ever needed).
 _TEMPORAL_WINDOW = 5
-_LOOKAHEAD       = 1
-_RNN_HIDDEN      = 128
+_LOOKAHEAD = 1
+_RNN_HIDDEN = 128
 
 
 def _causal_window_indices(idx: int, n: int, window: int, lookahead: int) -> list[int]:
-    """Edge-clamped frame indices for a causal window ending `lookahead` ahead of idx."""
+    """Return edge-clamped indices for a causal window."""
     start = idx - (window - 1 - lookahead)
     return [min(n - 1, max(0, start + i)) for i in range(window)]
 
-# Augmentation pipelines applied only during training.
 _SPATIAL_AUGMENT = T.Compose([
     T.RandomHorizontalFlip(p=0.5),
     T.RandomAffine(degrees=8, translate=(0.08, 0.08), scale=(0.9, 1.1)),
@@ -68,34 +48,14 @@ _COLOR_AUGMENT = T.Compose([
     T.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5)),
 ])
 
-# Extra, harder degradation applied ONLY to the close-up half.
-#
-# The close-up input pixels are the same footage the human editor cut into the
-# result, from which the pseudo-labels are derived.  With few concerts this
-# invites a shortcut: the model can latch onto the close-up's pixel/upscale
-# signature ("this exact clip was selected") instead of learning editorial cues.
-# Labels are computed once in sampler.py from clean pixels and cached, so
-# degrading the close-up INPUT here cannot corrupt the target — it only breaks
-# the input↔label pixel identity and forces content-based features.
 _CLOSEUP_EXTRA_BLUR = T.GaussianBlur(kernel_size=7, sigma=(0.5, 3.0))
 
 
 def _degrade_closeup(view: torch.Tensor) -> torch.Tensor:
-    """Aggressively degrade a single (3, H, W) uint8 close-up view.
-
-    Attacks the exact shortcut keys the model could exploit:
-    - resolution loss (down→up resample) destroys the upscale/codec signature,
-    - additive Gaussian noise breaks pixel-level identity with the labelled clip,
-    - extra blur removes high-frequency fingerprints.
-
-    Operates in uint8 pixel space (normalisation is deferred to the GPU), and is
-    applied stochastically so the model still occasionally sees near-clean
-    close-ups (matching the clean inference-time distribution).
-    """
+    """Apply a light corruption pass to close-up frames during training."""
     _, h, w = view.shape
-    # Resolution degradation: shrink then upscale back, masking the signature.
     if torch.rand(1).item() < 0.7:
-        scale = 0.35 + 0.40 * torch.rand(1).item()   # r ∈ [0.35, 0.75]
+        scale = 0.35 + 0.40 * torch.rand(1).item()
         f     = view.float().unsqueeze(0)
         small = F.interpolate(
             f, scale_factor=scale,
@@ -104,11 +64,9 @@ def _degrade_closeup(view: torch.Tensor) -> torch.Tensor:
         f     = F.interpolate(small, size=(h, w), mode="bilinear", align_corners=False)
         view  = f.squeeze(0).round().clamp_(0, 255).to(torch.uint8)
 
-    # Extra blur on top of the shared color pipeline.
     if torch.rand(1).item() < 0.5:
         view = _CLOSEUP_EXTRA_BLUR(view)
 
-    # Additive noise in uint8 pixel space (≈ up to 12 grey levels).
     if torch.rand(1).item() < 0.6:
         sigma = 12.0 * torch.rand(1).item()
         noise = torch.randn(view.shape) * sigma
@@ -118,14 +76,7 @@ def _degrade_closeup(view: torch.Tensor) -> torch.Tensor:
 
 
 def _augment_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    """Apply augmentation to a 3-ch or K*6-ch uint8 tensor.
-
-    Runs in uint8 pixel space (the conventional domain for these torchvision
-    transforms); ImageNet normalisation happens later on the GPU. The spatial
-    transform is shared across all channels (consistent flip/affine over the
-    window); color transforms are applied per camera view, and the close-up half
-    gets extra degradation to break the input↔label pixel identity (_degrade_closeup).
-    """
+    """Apply training-time image augmentation."""
     n_ch = tensor.shape[0]
     if n_ch % 6 == 0:
         tensor = _SPATIAL_AUGMENT(tensor)
@@ -137,36 +88,23 @@ def _augment_tensor(tensor: torch.Tensor) -> torch.Tensor:
             parts.append(wide)
             parts.append(close)
         return torch.cat(parts, dim=0)
-    # 3-ch single-camera fallback
     return _SPATIAL_AUGMENT(_COLOR_AUGMENT(tensor))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Module-level helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _preprocess_frame(frame: np.ndarray) -> torch.Tensor:
-    """Convert a BGR uint8 frame to a normalised CHW float tensor.
-
-    Handles both 3-channel (single camera) and 6-channel (dual camera) frames.
-    For 6-channel, each 3-channel half is independently normalised.
-    """
-    # Frames are already stored at _INPUT_SIZE by the sampler/inference paths, so
-    # skip the resize in that (hot) case — it runs K× per sample every epoch.
-    # Only resize defensively when a caller passes a differently-sized frame.
+    """Convert a BGR frame to a normalised CHW tensor."""
     if frame.shape[1] != _INPUT_SIZE[0] or frame.shape[0] != _INPUT_SIZE[1]:
         resized = cv2.resize(frame, _INPUT_SIZE)
     else:
         resized = frame
     if resized.ndim == 3 and resized.shape[2] == 6:
-        # Dual-frame: channels 0-2 = wide BGR, 3-5 = closeup BGR
-        wide_rgb   = cv2.cvtColor(resized[:, :, :3], cv2.COLOR_BGR2RGB)
-        close_rgb  = cv2.cvtColor(resized[:, :, 3:], cv2.COLOR_BGR2RGB)
-        wide_t     = torch.from_numpy(wide_rgb).permute(2, 0, 1).float() / 255.0
-        close_t    = torch.from_numpy(close_rgb).permute(2, 0, 1).float() / 255.0
-        wide_t     = (wide_t  - _IMAGENET_MEAN) / _IMAGENET_STD
-        close_t    = (close_t - _IMAGENET_MEAN) / _IMAGENET_STD
-        return torch.cat([wide_t, close_t], dim=0)  # shape: (6, 224, 224)
+        wide_rgb = cv2.cvtColor(resized[:, :, :3], cv2.COLOR_BGR2RGB)
+        close_rgb = cv2.cvtColor(resized[:, :, 3:], cv2.COLOR_BGR2RGB)
+        wide_t = torch.from_numpy(wide_rgb).permute(2, 0, 1).float() / 255.0
+        close_t = torch.from_numpy(close_rgb).permute(2, 0, 1).float() / 255.0
+        wide_t = (wide_t - _IMAGENET_MEAN) / _IMAGENET_STD
+        close_t = (close_t - _IMAGENET_MEAN) / _IMAGENET_STD
+        return torch.cat([wide_t, close_t], dim=0)
     else:
         rgb    = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
@@ -174,33 +112,20 @@ def _preprocess_frame(frame: np.ndarray) -> torch.Tensor:
 
 
 def _frame_to_uint8_chw(frame: np.ndarray) -> torch.Tensor:
-    """Convert a BGR uint8 frame to an RGB uint8 CHW tensor (no normalisation).
-
-    Normalisation is deferred to the GPU (see _normalize_windows) so that only
-    1-byte-per-channel data crosses the CPU→GPU boundary — 4× less PCIe traffic
-    than transferring pre-normalised float32, and the per-frame float/normalise
-    work moves off the DataLoader workers onto the GPU.
-    """
+    """Convert a BGR frame to an RGB uint8 CHW tensor."""
     if frame.shape[1] != _INPUT_SIZE[0] or frame.shape[0] != _INPUT_SIZE[1]:
         frame = cv2.resize(frame, _INPUT_SIZE)
     if frame.ndim == 3 and frame.shape[2] == 6:
-        order = [2, 1, 0, 5, 4, 3]   # BGR|BGR → RGB|RGB
+        order = [2, 1, 0, 5, 4, 3]
     else:
-        order = [2, 1, 0]            # BGR → RGB
+        order = [2, 1, 0]
     rgb = np.ascontiguousarray(frame[..., order])
     return torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
 
 
 def _normalize_windows(x: torch.Tensor) -> torch.Tensor:
-    """uint8 (B, C, H, W) RGB → ImageNet-normalised float in channels_last.
-
-    C is a multiple of 3; the 3-channel ImageNet mean/std are tiled across all
-    camera views / temporal frames.  Runs on whatever device x already lives on
-    (the GPU during training/inference), moving the float+normalise cost off the
-    CPU DataLoader workers.  Returns channels_last so the conv backbone (#2) gets
-    its preferred memory layout.
-    """
-    c    = x.shape[1]
+    """Convert uint8 RGB windows to ImageNet-normalised float tensors."""
+    c = x.shape[1]
     mean = _IMAGENET_MEAN.to(x.device).repeat(c // 3, 1, 1)
     std  = _IMAGENET_STD.to(x.device).repeat(c // 3, 1, 1)
     x    = x.float().div_(255.0).sub_(mean).div_(std)
@@ -208,10 +133,7 @@ def _normalize_windows(x: torch.Tensor) -> torch.Tensor:
 
 
 def _build_mobilenet(num_classes: int) -> nn.Module:
-    """Load pretrained MobileNetV3-Small for single-frame (3-ch) classification.
-
-    Freezes all but the last three feature blocks for domain adaptation.
-    """
+    """Load a pretrained MobileNetV3-Small and adapt the head."""
     model = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1)
 
     for param in model.features.parameters():
@@ -231,21 +153,10 @@ def _build_mobilenet(num_classes: int) -> nn.Module:
 
 
 class _DualStreamModel(nn.Module):
-    """Siamese backbone + temporal GRU over a causal window.
-
-    A shared MobileNetV3 backbone encodes each camera per frame, producing Siamese
-    comparison features [wide, close, |wide-close|, wide*close] at each timestep.
-    A GRU consumes the sequence of comparison vectors (plus optional audio features)
-    and its final hidden state — the causal summary at the decision point — is
-    classified. This replaces the earlier temporal mean-pool, which discarded order
-    and produced jittery per-frame predictions.
-
-    The last 5 feature blocks are unfrozen; earlier blocks stay frozen to preserve
-    generic ImageNet features and prevent overfitting to just 2-3 training concerts.
-    """
+    """Shared-backbone temporal model over a causal window."""
 
     _UNFREEZE_BLOCKS = 5
-    _COMPARISON_DIM  = 576 * 4  # [wide, close, |diff|, prod] over 576-d features
+    _COMPARISON_DIM = 576 * 4
 
     def __init__(self, num_classes: int = 2, rnn_hidden: int = _RNN_HIDDEN, audio_dim: int = 0):
         super().__init__()
@@ -273,20 +184,14 @@ class _DualStreamModel(nn.Module):
         )
 
     def _extract(self, x: torch.Tensor) -> torch.Tensor:
-        """Run 3-channel input through shared backbone → feature vector."""
-        # Narrowing the channel dim of a channels_last window drops the layout;
-        # restore it so the conv backbone runs in its fast path (#2).
+        """Run one camera view through the shared backbone."""
         x = x.contiguous(memory_format=torch.channels_last)
         x = self.features(x)
         x = self.avgpool(x)
         return x.flatten(1)
 
     def forward(self, x: torch.Tensor, audio: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """x: (B, K*6, H, W); optional audio: (B, K, audio_dim).
-
-        Per-frame Siamese comparison → GRU over the causal window → classify the
-        final hidden state (the summary at the most recent, decision-point frame).
-        """
+        """Run a window through the dual-stream model."""
         K = x.shape[1] // 6
         comparisons: list[torch.Tensor] = []
         for k in range(K):
@@ -308,20 +213,7 @@ class _DualStreamModel(nn.Module):
 
 
 class _FrameDataset(torch.utils.data.Dataset):
-    """Windowed dataset over one or more concerts.
-
-    Each concert's frames are kept as their own contiguous uint8 array (typically
-    memory-mapped from the cache), so training never concatenates concerts into a
-    single large anonymous RAM buffer. Causal temporal windows are built *within*
-    a concert and clamped to its bounds, so a window never bleeds across the join
-    between two different concerts.
-
-    Two construction paths:
-    - ``_FrameDataset(frames, labels, ...)`` — a single concert (used by tests);
-      yields ``(window, label)`` unless weights/audio are supplied.
-    - ``_FrameDataset.from_concerts([SampleSet, ...], ...)`` — multiple concerts;
-      always yields ``(window, label, weight, audio)``.
-    """
+    """Dataset that yields causal temporal windows for a sample set."""
 
     def __init__(
         self,
@@ -379,51 +271,41 @@ class _FrameDataset(torch.utils.data.Dataset):
         return tensor, labels[li], weight, audio_win
 
     def _audio_window(self, audio: np.ndarray, li: int) -> torch.Tensor:
-        """Per-frame audio features for the same causal window as the visual frames."""
+        """Audio features for the same causal window."""
         indices = _causal_window_indices(li, len(audio), self.window, self.lookahead)
-        return torch.from_numpy(audio[indices]).float()  # (window, n_mels)
+        return torch.from_numpy(audio[indices]).float()
 
     def _build_window(self, frames: np.ndarray, li: int) -> torch.Tensor:
-        """Return the causal window at *li* within *frames* as a (window*6, H, W) uint8 tensor.
-
-        Kept as uint8 — normalisation is deferred to the GPU (_normalize_windows).
-        """
+        """Build the causal window for a given frame index."""
         indices = _causal_window_indices(li, len(frames), self.window, self.lookahead)
         return torch.cat([_frame_to_uint8_chw(frames[j]) for j in indices], dim=0)
 
 
 def _make_class_weights(labels: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Inverse-frequency class weights: w_k = n_total / (K * n_k)."""
+    """Inverse-frequency class weights."""
     counts  = torch.bincount(labels).float()
     weights = counts.sum() / (len(counts) * counts)
     return weights.to(device)
 
 
 def _wrap_tqdm(iterable, **kwargs):
-    """Return a tqdm-wrapped iterable if tqdm is installed, otherwise plain."""
+    """Wrap an iterable with tqdm when available."""
     if _TQDM_AVAILABLE:
         return tqdm(iterable, **kwargs)
     return iterable
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ViewClassifier
-# ─────────────────────────────────────────────────────────────────────────────
-
 class ViewClassifier:
-    """Binary classifier: 0 = wide/total shot, 1 = close-up shot.
-
-    Wraps MobileNetV3-Small pretrained on ImageNet, fine-tuned on concert data.
-    """
+    """Binary wide-vs-close-up classifier."""
 
     def __init__(
         self,
         num_classes: int = 2,
-        dual_frame:  bool = True,
-        window:      int = _TEMPORAL_WINDOW,
-        lookahead:   int = _LOOKAHEAD,
-        rnn_hidden:  int = _RNN_HIDDEN,
-        audio_dim:   int = 0,
+        dual_frame: bool = True,
+        window: int = _TEMPORAL_WINDOW,
+        lookahead: int = _LOOKAHEAD,
+        rnn_hidden: int = _RNN_HIDDEN,
+        audio_dim: int = 0,
         audio_sample_rate: int = 16000,
     ):
         self.num_classes = num_classes
@@ -433,46 +315,37 @@ class ViewClassifier:
         self.rnn_hidden  = rnn_hidden
         self.audio_dim   = audio_dim
         self.audio_sample_rate = audio_sample_rate
-        self.device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # channels_last (#2): conv backbones run faster in NHWC under AMP.
-        self.model       = self._make_model().to(
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = self._make_model().to(
             self.device, memory_format=torch.channels_last
         )
-        # Forward handle — replaced by a torch.compile wrapper in train() when on
-        # CUDA.  Kept separate so self.model stays eager (clean state_dict keys).
-        self._model_fwd  = self.model
-        self.is_trained  = False
+        self._model_fwd = self.model
+        self.is_trained = False
 
     def _make_model(self) -> nn.Module:
-        """Build the appropriate architecture."""
+        """Build the model for the selected input mode."""
         if self.dual_frame:
             return _DualStreamModel(self.num_classes, rnn_hidden=self.rnn_hidden, audio_dim=self.audio_dim)
         return _build_mobilenet(self.num_classes)
 
     def _forward(self, x: torch.Tensor, audio: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Run the forward handle, passing audio only to the dual-stream model."""
+        """Run one forward pass, with audio only for the dual-stream model."""
         if self.dual_frame:
             return self._model_fwd(x, audio)
         return self._model_fwd(x)
 
-    # ── Training ──────────────────────────────────────────────────────────────
-
     def train(
         self,
         train_concerts: list,
-        val_data:       "SampleSet",
-        epochs:       int   = 40,
-        batch_size:   int   = 32,
-        lr:           float = 3e-4,
-        patience:     int   = 15,
-        num_workers:  int   = _NUM_WORKERS,
-        use_compile:  bool  = True,
+        val_data: "SampleSet",
+        epochs: int = 40,
+        batch_size: int = 32,
+        lr: float = 3e-4,
+        patience: int = 15,
+        num_workers: int = _NUM_WORKERS,
+        use_compile: bool = True,
     ) -> None:
-        """Fine-tune with mixed-precision, early stopping on balanced accuracy.
-
-        `train_concerts` is a list of SampleSets kept separate (never concatenated)
-        so their frames stay memory-mapped; `val_data` is the single held-out concert.
-        """
+        """Train the model with early stopping on balanced accuracy."""
         train_labels = [l for c in train_concerts for l in c.labels]
         n_train      = sum(len(c.frames) for c in train_concerts)
         n_val        = len(val_data.frames)
@@ -484,9 +357,6 @@ class ViewClassifier:
             [val_data], augment=False, window=self.window, lookahead=self.lookahead,
         )
 
-        # pin_memory speeds up CPU→GPU transfers but requires extra page-locked
-        # RAM.  Disable it when workers=0 (no async prefetch anyway) or when
-        # the dataset is large and RAM is tight.
         pin = self.device.type == "cuda" and num_workers > 0
         train_loader = DataLoader(
             train_ds, batch_size=batch_size, shuffle=True,
@@ -499,10 +369,6 @@ class ViewClassifier:
             persistent_workers=num_workers > 0,
         )
 
-        # torch.compile (#2): fuse kernels for a CUDA speedup.  Wrap a SEPARATE
-        # handle so self.model stays an eager module (clean state_dict keys for
-        # save/load).  Controlled by config (training.compile); MLCAMOP_NO_COMPILE=1
-        # is a hard override that always disables it.
         self._model_fwd = self.model
         env_disabled = os.environ.get("MLCAMOP_NO_COMPILE") == "1"
         if self.device.type == "cuda" and use_compile and not env_disabled:
@@ -516,10 +382,6 @@ class ViewClassifier:
         class_weights = _make_class_weights(y_train, self.device)
         criterion     = nn.CrossEntropyLoss(weight=class_weights, reduction="none")
 
-        # Differential learning rates — 3 tiers across the unfrozen backbone blocks.
-        # Works for both architectures:
-        #   Single-frame: model.features + model.classifier
-        #   Dual-stream:  model.features (shared) + model.head
         features = self.model.features
 
         if self.dual_frame:
@@ -559,12 +421,10 @@ class ViewClassifier:
                 weight_decay=1e-3,
             )
 
-        # CosineAnnealingLR: smooth decay from lr → eta_min over full budget.
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=epochs, eta_min=1e-6
         )
 
-        # Mixed-precision scaler — no-op on CPU
         use_amp = self.device.type == "cuda"
         scaler  = GradScaler("cuda", enabled=use_amp)
 
@@ -613,13 +473,13 @@ class ViewClassifier:
 
     def _run_epoch(
         self,
-        loader:    DataLoader,
+        loader: DataLoader,
         criterion: nn.Module,
         optimizer: torch.optim.Optimizer,
-        scaler:    GradScaler,
-        training:  bool,
+        scaler: GradScaler,
+        training: bool,
     ) -> float:
-        """Run one full pass over *loader*, return mean loss."""
+        """Run one epoch and return mean loss."""
         self.model.train(training)
         total_loss = 0.0
 
@@ -633,8 +493,7 @@ class ViewClassifier:
 
                 with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
                     outputs = self._forward(batch_x, audio)
-                    # Per-sample loss weighted so transition frames count less (#5).
-                    loss    = (criterion(outputs, batch_y) * batch_w).mean()
+                    loss = (criterion(outputs, batch_y) * batch_w).mean()
 
                 if training:
                     optimizer.zero_grad(set_to_none=True)
@@ -649,7 +508,7 @@ class ViewClassifier:
         return total_loss / len(loader)
 
     def _evaluate(self, loader: DataLoader, criterion: nn.Module) -> tuple[float, float, float]:
-        """Return (mean_loss, accuracy, balanced_accuracy)."""
+        """Return (loss, accuracy, balanced_accuracy)."""
         total_loss = 0.0
         all_preds: list[int] = []
         all_labels: list[int] = []
@@ -668,12 +527,10 @@ class ViewClassifier:
                 all_preds.extend(preds.cpu().tolist())
                 all_labels.extend(batch_y.cpu().tolist())
 
-        # Standard accuracy
-        correct  = sum(p == l for p, l in zip(all_preds, all_labels))
+        correct = sum(p == l for p, l in zip(all_preds, all_labels))
         accuracy = correct / len(all_labels)
 
-        # Balanced accuracy: mean recall per class
-        preds_t  = torch.tensor(all_preds)
+        preds_t = torch.tensor(all_preds)
         labels_t = torch.tensor(all_labels)
         n_classes = labels_t.max().item() + 1
         per_class_recall = []
@@ -686,18 +543,13 @@ class ViewClassifier:
 
         return total_loss / len(loader), accuracy, bal_acc
 
-    # ── Inference ─────────────────────────────────────────────────────────────
-
     def predict(self, frame: np.ndarray) -> int:
-        """Predict for a single frame by repeating it across the window."""
+        """Predict a single frame using a repeated temporal window."""
         frames = np.stack([frame] * self.window)
         return self.predict_batch(frames)[self.window // 2]
 
     def predict_window(self, window_frames: list[np.ndarray], window_audio: np.ndarray | None = None) -> int:
-        """Classify one explicit causal window of `self.window` frames (+ optional audio).
-
-        Used by streaming inference, which owns the ring buffer of decoded frames.
-        """
+        """Classify one causal window of frames."""
         x = torch.cat([_frame_to_uint8_chw(f) for f in window_frames], dim=0)
         x = _normalize_windows(x.unsqueeze(0).to(self.device, non_blocking=True))
         audio = None
@@ -711,17 +563,11 @@ class ViewClassifier:
 
     def predict_batch(
         self,
-        frames:     np.ndarray | list[np.ndarray],
-        audio:      np.ndarray | None = None,
+        frames: np.ndarray | list[np.ndarray],
+        audio: np.ndarray | None = None,
         batch_size: int = 128,
     ) -> list[int]:
-        """Predict a label per frame using the causal temporal window.
-
-        Frames must be one contiguous array of consecutive frames so windows are
-        built correctly. Each index i is scored from its causal window (past
-        frames plus `self.lookahead` future frames), edge-clamped at boundaries.
-        Pass `audio` (N, n_mels) when the model has an audio branch.
-        """
+        """Predict labels for a sequence of frames."""
         self.model.eval()
         all_preds: list[int] = []
 
@@ -746,10 +592,8 @@ class ViewClassifier:
 
         return all_preds
 
-    # ── Persistence ───────────────────────────────────────────────────────────
-
     def save(self, path: str) -> None:
-        """Save model weights to disk. Creates parent directories if needed."""
+        """Save model weights to disk."""
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -769,7 +613,7 @@ class ViewClassifier:
         print(f"Model saved to {path}")
 
     def load(self, path: str) -> None:
-        """Load model weights, rebuilding the architecture to match the checkpoint."""
+        """Load model weights from a checkpoint."""
         data = torch.load(path, map_location=self.device, weights_only=False)
 
         if isinstance(data, dict) and "state_dict" in data:

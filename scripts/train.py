@@ -1,4 +1,4 @@
-"""Train the ViewClassifier on concert video data."""
+"""Train the view classifier."""
 
 import argparse
 import gc
@@ -15,7 +15,7 @@ from src.utils.metrics import balanced_accuracy, cut_event_prf
 
 
 def train_model(config: dict) -> None:
-    """Load concert data, split train/val, train ViewClassifier, save checkpoint."""
+    """Load data, train, and save the checkpoint."""
     logger = setup_logger(config["logging"]["log_file"], config["logging"].get("level", "INFO"))
 
     concerts      = config["data"]["concerts"]
@@ -70,8 +70,6 @@ def train_model(config: dict) -> None:
             "Using concert-level split: training on concerts 1–%d, validating on concert %d.",
             len(concerts) - 1, len(concerts),
         )
-        # Keep training concerts separate (not concatenated) so their frames stay
-        # memory-mapped instead of materialising into one large anonymous buffer.
         train_concerts = concert_sets[:-1]
         val_data       = concert_sets[-1]
     else:
@@ -122,11 +120,7 @@ def train_model(config: dict) -> None:
 
 
 def _report_per_concert(config: dict, classifier: ViewClassifier, logger) -> None:
-    """Score each concert on its own so overfitting to a single venue/rig is visible.
-
-    Concerts used for training will score higher than the held-out one; a large gap
-    signals poor generalisation. Uses cached frames, so this is cheap.
-    """
+    """Score each concert independently for a quick overfit check."""
     concerts      = config["data"]["concerts"]
     sample_fps    = config["data"].get("sample_fps", 1.0)
     cache_dir     = config["data"].get("cache_dir", "data/cache")
@@ -179,10 +173,7 @@ if __name__ == "__main__":
     if args.random_split:
         cfg["_force_random_split"] = True
 
-    # Allow TF32 on Ampere+ GPUs — ~2× faster matmuls with negligible precision loss
     torch.set_float32_matmul_precision("high")
-    # cuDNN auto-tuner: finds fastest conv algorithm for the fixed input size.
-    # ~10s overhead on first batch, then faster for all subsequent batches.
     torch.backends.cudnn.benchmark = True
 
     train_model(cfg)

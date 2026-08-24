@@ -1,4 +1,4 @@
-"""Evaluate a trained ViewClassifier on held-out data and print a report."""
+"""Evaluate the model on held-out data."""
 
 import argparse
 
@@ -13,7 +13,7 @@ from src.utils.metrics import cut_event_prf
 
 
 def evaluate(config: dict) -> None:
-    """Run the trained model on the held-out validation split and print a report."""
+    """Run the validation split and print metrics."""
     logger = setup_logger(config["logging"]["log_file"], config["logging"].get("level", "INFO"))
 
     concerts   = config["data"]["concerts"]
@@ -99,8 +99,6 @@ def evaluate(config: dict) -> None:
     print(f"Close-up recall:   {c_rec    * 100:.1f}%")
     logger.info("Balanced accuracy: %.1f%%", bal_acc * 100)
 
-    # Event-based cut metrics need the frames in temporal order; the shuffled
-    # single-concert split breaks that, so only report them on the ordered path.
     if ordered:
         sample_fps    = config["data"].get("sample_fps", 1.0)
         tolerance_sec = config["evaluation"].get("cut_tolerance_sec", 0.4)
