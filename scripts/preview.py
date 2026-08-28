@@ -2,6 +2,8 @@
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
 
 import cv2
@@ -12,64 +14,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.models.view_classifier import ViewClassifier
 from src.pipeline.inference import classify_video
-from src.pipeline.editing import assemble_cut
-from src.postprocessing.renderer import render_video
+from src.pipeline.editing import _enforce_min_shot_length
 
 try:
     from tqdm import tqdm
     _TQDM = True
 except ImportError:
     _TQDM = False
-
-
-def _read_all_frames(path: str, desc: str) -> tuple[list[np.ndarray], float]:
-    """Read a video fully into memory."""
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise ValueError(f"Cannot open video: {path}")
-
-    fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    frames: list[np.ndarray] = []
-    iterable = tqdm(range(total_frames), desc=desc, unit="frame") if _TQDM else range(total_frames)
-
-    for _ in iterable:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(frame)
-
-    cap.release()
-    return frames, fps
-
-
-def _read_frames_at_timestamps(
-    path:       str,
-    timestamps: list[float],
-    fps:        float,
-    desc:       str,
-) -> list[np.ndarray]:
-    """Read frames at specific timestamps."""
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise ValueError(f"Cannot open video: {path}")
-
-    frames: list[np.ndarray] = []
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    blank  = np.zeros((height, width, 3), dtype=np.uint8)
-
-    iterable = tqdm(timestamps, desc=desc, unit="frame") if _TQDM else timestamps
-
-    for ts in iterable:
-        idx = int(ts * fps)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        frames.append(frame if ret else blank)
-
-    cap.release()
-    return frames
 
 
 def _simulate_closeup(frame: np.ndarray, crop_factor: float) -> np.ndarray:
@@ -85,6 +36,93 @@ def _simulate_closeup(frame: np.ndarray, crop_factor: float) -> np.ndarray:
     return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
+def _render_preview(
+    total_view_path: str,
+    closeup_path:    str | None,
+    output_path:     str,
+    timestamps:      list[float],
+    labels:          list[int],
+    video_fps:       float,
+    crop_factor:     float,
+) -> None:
+    cap_total = cv2.VideoCapture(total_view_path)
+    if not cap_total.isOpened():
+        raise ValueError(f"Cannot open video: {total_view_path}")
+
+    cap_closeup = None
+    if closeup_path:
+        cap_closeup = cv2.VideoCapture(closeup_path)
+        if not cap_closeup.isOpened():
+            raise ValueError(f"Cannot open video: {closeup_path}")
+
+    width  = int(cap_total.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap_total.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap_total.get(cv2.CAP_PROP_FRAME_COUNT))
+    blank  = np.zeros((height, width, 3), dtype=np.uint8)
+    video_only_path = f"{output_path}.video.mp4"
+
+    writer = cv2.VideoWriter(
+        video_only_path,
+        cv2.VideoWriter.fourcc(*"mp4v"),
+        video_fps,
+        (width, height),
+    )
+
+    sample_frames = [int(ts * video_fps) for ts in timestamps]
+    sample_idx = 0
+    current_label = labels[0] if labels else 0
+
+    iterable = tqdm(range(total_frames), desc="  rendering", unit="frame") if _TQDM else range(total_frames)
+    for frame_idx in iterable:
+        while sample_idx + 1 < len(sample_frames) and frame_idx >= sample_frames[sample_idx + 1]:
+            sample_idx += 1
+            current_label = labels[sample_idx]
+
+        if current_label == 1 and cap_closeup is not None:
+            cap_total.grab()
+            ok, frame = cap_closeup.read()
+            frame = frame if ok else blank
+        else:
+            ok, total_frame = cap_total.read()
+            total_frame = total_frame if ok else blank
+            if cap_closeup is not None:
+                cap_closeup.grab()
+            frame = total_frame if current_label == 0 else _simulate_closeup(total_frame, crop_factor)
+        writer.write(frame)
+
+    writer.release()
+    cap_total.release()
+    if cap_closeup is not None:
+        cap_closeup.release()
+
+    _mux_audio(video_only_path, total_view_path, output_path)
+
+
+def _mux_audio(video_only_path: str, audio_source_path: str, output_path: str) -> None:
+    if shutil.which("ffmpeg") is None:
+        os.replace(video_only_path, output_path)
+        print("ffmpeg not found; wrote video without audio.")
+        return
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_only_path,
+        "-i", audio_source_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0?",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-shortest",
+        output_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.remove(video_only_path)
+    except subprocess.CalledProcessError:
+        os.replace(video_only_path, output_path)
+        print("Could not mux audio; wrote video without audio.")
+
+
 def run_preview(
     total_view_path: str,
     output_path:     str,
@@ -92,7 +130,7 @@ def run_preview(
     sample_fps:      float,
     crop_factor:     float,
     closeup_path:    str | None = None,
-    min_shot_sec:    float      = 0.5,
+    min_shot_sec:    float      = 1,
 ) -> None:
     """Classify shots and render a preview cut."""
     print(f"Loading model from {checkpoint} ...")
@@ -125,32 +163,15 @@ def run_preview(
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     cap.release()
 
-    print("Reading total-view frames ...")
-    total_frames = _read_frames_at_timestamps(
-        total_view_path, timestamps, video_fps, desc="  total_view"
-    )
-
-    if closeup_path:
-        print(f"Reading close-up frames from {closeup_path} ...")
-        closeup_frames = _read_frames_at_timestamps(
-            closeup_path, timestamps, video_fps, desc="  closeup"
-        )
-    else:
-        crop_pct = int(crop_factor * 100)
-        print(f"Simulating close-up with {crop_pct}% centre-crop (digital zoom) ...")
-        iterable = (
-            tqdm(total_frames, desc="  simulating crop", unit="frame")
-            if _TQDM else total_frames
-        )
-        closeup_frames = [_simulate_closeup(f, crop_factor) for f in iterable]
-
     min_shot_frames = max(1, int(min_shot_sec * sample_fps))
-    print(f"Assembling cut (min shot = {min_shot_sec}s = {min_shot_frames} samples) ...")
-    output_frames = assemble_cut(total_frames, closeup_frames, labels, min_shot_frames)
+    smoothed_labels = _enforce_min_shot_length(labels, min_shot_frames)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    print(f"Rendering {len(output_frames)} frames to {output_path} ...")
-    render_video(output_frames, output_path, fps=sample_fps)
+    print(f"Rendering full-rate preview to {output_path} (min shot = {min_shot_sec}s) ...")
+    _render_preview(
+        total_view_path, closeup_path, output_path, timestamps, smoothed_labels,
+        video_fps, crop_factor,
+    )
     print(f"Done.  Output written to: {output_path}")
 
 

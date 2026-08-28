@@ -592,6 +592,38 @@ class ViewClassifier:
 
         return all_preds
 
+    def predict_proba_batch(
+        self,
+        frames: np.ndarray | list[np.ndarray],
+        audio: np.ndarray | None = None,
+        batch_size: int = 128,
+    ) -> np.ndarray:
+        """Per-frame class probabilities (N, num_classes) for sequence smoothing."""
+        self.model.eval()
+        all_probs: list[np.ndarray] = []
+
+        if not isinstance(frames, np.ndarray):
+            frames = np.asarray(frames)
+        n = len(frames)
+
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            windows, audio_windows = [], []
+            for idx in range(start, end):
+                indices = _causal_window_indices(idx, n, self.window, self.lookahead)
+                windows.append(torch.cat([_frame_to_uint8_chw(frames[j]) for j in indices], dim=0))
+                if audio is not None:
+                    audio_windows.append(torch.from_numpy(audio[indices]).float())
+            x = _normalize_windows(torch.stack(windows).to(self.device, non_blocking=True))
+            a = torch.stack(audio_windows).to(self.device) if audio is not None else None
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
+                    logits = self._forward(x, a)
+            probs = torch.softmax(logits.float(), dim=1)
+            all_probs.append(probs.cpu().numpy())
+
+        return np.concatenate(all_probs, axis=0)
+
     def save(self, path: str) -> None:
         """Save model weights to disk."""
         parent = os.path.dirname(path)
