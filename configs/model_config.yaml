@@ -63,7 +63,7 @@ evaluation:
   cut_tolerance_sec: 1
   smoothing:
     penalty_sweep: [0.0, 0.1, 0.25, 0.5, 1.0, 2.0]
-    cut_penalty: 20.1
+    cut_penalty: 0.5
 
 logging:
   log_file: "logs/training.log"

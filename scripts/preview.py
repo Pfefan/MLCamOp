@@ -13,7 +13,7 @@ import yaml
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.models.view_classifier import ViewClassifier
-from src.pipeline.inference import classify_video
+from src.pipeline.inference import classify_video_smoothed
 from src.pipeline.editing import _enforce_min_shot_length
 
 try:
@@ -23,19 +23,6 @@ except ImportError:
     _TQDM = False
 
 
-def _simulate_closeup(frame: np.ndarray, crop_factor: float) -> np.ndarray:
-    """Simulate a close-up by centre-cropping and scaling up."""
-    h, w = frame.shape[:2]
-    crop_h = int(h * crop_factor)
-    crop_w = int(w * crop_factor)
-
-    y0 = (h - crop_h) // 2
-    x0 = (w - crop_w) // 2
-
-    cropped = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
-    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
-
-
 def _render_preview(
     total_view_path: str,
     closeup_path:    str | None,
@@ -43,7 +30,6 @@ def _render_preview(
     timestamps:      list[float],
     labels:          list[int],
     video_fps:       float,
-    crop_factor:     float,
 ) -> None:
     cap_total = cv2.VideoCapture(total_view_path)
     if not cap_total.isOpened():
@@ -83,11 +69,10 @@ def _render_preview(
             ok, frame = cap_closeup.read()
             frame = frame if ok else blank
         else:
-            ok, total_frame = cap_total.read()
-            total_frame = total_frame if ok else blank
+            ok, frame = cap_total.read()
+            frame = frame if ok else blank
             if cap_closeup is not None:
                 cap_closeup.grab()
-            frame = total_frame if current_label == 0 else _simulate_closeup(total_frame, crop_factor)
         writer.write(frame)
 
     writer.release()
@@ -128,9 +113,9 @@ def run_preview(
     output_path:     str,
     checkpoint:      str,
     sample_fps:      float,
-    crop_factor:     float,
     closeup_path:    str | None = None,
-    min_shot_sec:    float      = 1,
+    min_shot_sec:    float      = 0.0,
+    cut_penalty:     float      = 0.5,
 ) -> None:
     """Classify shots and render a preview cut."""
     print(f"Loading model from {checkpoint} ...")
@@ -140,12 +125,13 @@ def run_preview(
     if classifier.dual_frame and closeup_path is None:
         raise ValueError(
             "Checkpoint is a dual-frame model and needs a real close-up feed. "
-            "Pass --closeup; the simulated digital zoom cannot be classified."
+            "Pass --closeup or use --concert."
         )
 
-    print(f"Classifying shots in {total_view_path} ...")
-    predictions = classify_video(
-        total_view_path, classifier, sample_fps=sample_fps, closeup_path=closeup_path,
+    print(f"Classifying shots in {total_view_path} (Viterbi smoothing, penalty={cut_penalty}) ...")
+    predictions = classify_video_smoothed(
+        total_view_path, classifier, sample_fps=sample_fps,
+        closeup_path=closeup_path, cut_penalty=cut_penalty,
     )
 
     timestamps = [ts    for ts, _     in predictions]
@@ -164,20 +150,22 @@ def run_preview(
     cap.release()
 
     min_shot_frames = max(1, int(min_shot_sec * sample_fps))
-    smoothed_labels = _enforce_min_shot_length(labels, min_shot_frames)
+    smoothed_labels = (
+        _enforce_min_shot_length(labels, min_shot_frames) if min_shot_frames > 1 else labels
+    )
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    print(f"Rendering full-rate preview to {output_path} (min shot = {min_shot_sec}s) ...")
+    print(f"Rendering full-rate preview to {output_path} ...")
     _render_preview(
         total_view_path, closeup_path, output_path, timestamps, smoothed_labels,
-        video_fps, crop_factor,
+        video_fps,
     )
     print(f"Done.  Output written to: {output_path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Preview the auto-edit on a single wide-shot video.",
+        description="Render an auto-edited cut (full frame rate, with audio).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -186,40 +174,57 @@ if __name__ == "__main__":
         help="Path to model_config.yaml (default: configs/model_config.yaml)",
     )
     parser.add_argument(
-        "--input", required=True,
-        help="Path to the wide-shot (total_view) video.",
+        "--concert", type=int, default=None,
+        help="0-based index of a concert in the config to render. "
+             "Use this instead of --input/--closeup.",
+    )
+    parser.add_argument(
+        "--input", default=None,
+        help="Path to the wide-shot (total_view) video. "
+             "Alternative to --concert.",
     )
     parser.add_argument(
         "--closeup", default=None,
-        help="Optional: path to a real close-up video.  "
-             "If omitted, a digital zoom is simulated from --input.",
+        help="Path to the close-up video (required by dual-frame models). "
+             "Alternative to --concert.",
     )
     parser.add_argument(
         "--output", default="output/preview.mp4",
         help="Where to write the output MP4 (default: output/preview.mp4)",
     )
     parser.add_argument(
-        "--crop", type=float, default=0.5,
-        help="Centre-crop fraction for the simulated close-up (default: 0.5 = 2× zoom).  "
-             "Ignored if --closeup is provided.",
-    )
-    parser.add_argument(
-        "--min-shot", type=float, default=0.5,
+        "--min-shot", type=float, default=0.0,
         dest="min_shot",
-        help="Minimum cut duration in seconds (default: 0.5).  "
-             "Shorter predicted shots are merged with the surrounding shot.",
+        help="Optional extra minimum cut duration in seconds on top of Viterbi "
+             "smoothing (default: 0 = pure Viterbi, matches evaluation).",
     )
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
+    if args.concert is not None:
+        concerts = cfg["data"]["concerts"]
+        if not 0 <= args.concert < len(concerts):
+            parser.error(f"--concert {args.concert} out of range (0..{len(concerts) - 1})")
+        concert     = concerts[args.concert]
+        total_view  = concert["total_view"]
+        closeup     = concert["closeup"]
+    elif args.input is not None:
+        total_view  = args.input
+        closeup     = args.closeup
+    else:
+        parser.error("provide either --concert N or --input (with --closeup)")
+
+    _penalty = cfg.get("evaluation", {}).get("smoothing", {}).get("cut_penalty")
+    _penalty = 0.5 if _penalty is None else float(_penalty)
+
     run_preview(
-        total_view_path = args.input,
+        total_view_path = total_view,
         output_path     = args.output,
         checkpoint      = cfg["model"]["checkpoint"],
         sample_fps      = cfg["data"].get("sample_fps", 1.0),
-        crop_factor     = args.crop,
-        closeup_path    = args.closeup,
+        closeup_path    = closeup,
         min_shot_sec    = args.min_shot,
+        cut_penalty     = _penalty,
     )

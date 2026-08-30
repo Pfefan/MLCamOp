@@ -2,6 +2,7 @@
 
 import argparse
 import gc
+import os
 
 import torch
 import yaml
@@ -100,6 +101,13 @@ def train_model(config: dict) -> None:
     )
     logger.info("Using device: %s", classifier.device)
 
+    eval_cfg     = config.get("evaluation", {})
+    tolerance    = max(1, round(eval_cfg.get("cut_tolerance_sec", 0.4) * sample_fps))
+    smooth_pen   = eval_cfg.get("smoothing", {}).get("cut_penalty")
+    smooth_pen   = 0.1 if smooth_pen is None else float(smooth_pen)
+    base, ext    = os.path.splitext(config["model"]["checkpoint"])
+    cutf1_ckpt   = f"{base}_cutf1{ext}"
+
     classifier.train(
         train_concerts = train_concerts,
         val_data       = val_data,
@@ -109,6 +117,9 @@ def train_model(config: dict) -> None:
         patience       = config["training"].get("patience", 15),
         num_workers    = num_workers,
         use_compile    = config["training"].get("compile", True),
+        cut_tolerance_samples = tolerance,
+        smooth_penalty        = smooth_pen,
+        cutf1_checkpoint      = cutf1_ckpt,
     )
 
     save_path = config["model"]["checkpoint"]

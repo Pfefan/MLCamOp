@@ -7,6 +7,7 @@ import numpy as np
 
 from src.data.audio import extract_frame_audio_features
 from src.models.view_classifier import ViewClassifier, _causal_window_indices
+from src.utils.metrics import viterbi_smooth
 
 
 def _pad_window(frames: list[np.ndarray], window: int) -> list[np.ndarray]:
@@ -21,8 +22,13 @@ def classify_video(
     classifier:      ViewClassifier,
     sample_fps:      float = 1.0,
     closeup_path:    str | None = None,
-) -> list[tuple[float, int]]:
-    """Classify sampled frames and return (timestamp, label) pairs."""
+    return_proba:    bool = False,
+) -> list[tuple[float, int]] | tuple[list[float], np.ndarray]:
+    """Classify sampled frames.
+
+    Returns (timestamp, label) pairs by default, or (timestamps, probabilities)
+    when *return_proba* is set (used for sequence smoothing).
+    """
     cap_total = cv2.VideoCapture(total_view_path)
     if not cap_total.isOpened():
         raise ValueError(f"Cannot open video: {total_view_path}")
@@ -54,7 +60,7 @@ def classify_video(
 
     frame_buf: deque[np.ndarray] = deque(maxlen=window)
     timestamps: list[float]      = []
-    preds:      list[int]        = []
+    probs:      list[np.ndarray] = []
 
     idx     = 0
     sampled = 0
@@ -84,7 +90,7 @@ def classify_video(
 
             if sampled >= lookahead:
                 t = sampled - lookahead
-                preds.append(classifier.predict_window(
+                probs.append(classifier.predict_window_proba(
                     _pad_window(list(frame_buf), window), audio_window(t),
                 ))
             sampled += 1
@@ -95,14 +101,35 @@ def classify_video(
         cap_closeup.release()
 
     if not timestamps:
-        return []
+        return ([], np.zeros((0, classifier.num_classes), dtype=np.float32)) if return_proba else []
 
     buf_list = list(frame_buf)
     last     = buf_list[-1]
     for d in range(1, lookahead + 1):
         t = (sampled - 1) - lookahead + d
-        preds.append(classifier.predict_window(
+        probs.append(classifier.predict_window_proba(
             _pad_window(buf_list[d:] + [last] * d, window), audio_window(t),
         ))
 
-    return list(zip(timestamps, preds))
+    prob_arr = np.asarray(probs, dtype=np.float32)
+    if return_proba:
+        return timestamps, prob_arr
+    return list(zip(timestamps, prob_arr.argmax(axis=1).astype(int).tolist()))
+
+
+def classify_video_smoothed(
+    total_view_path: str,
+    classifier:      ViewClassifier,
+    sample_fps:      float = 1.0,
+    closeup_path:    str | None = None,
+    cut_penalty:     float = 0.5,
+) -> list[tuple[float, int]]:
+    """Classify then Viterbi-smooth the label sequence, matching the eval path."""
+    timestamps, probs = classify_video(
+        total_view_path, classifier, sample_fps=sample_fps,
+        closeup_path=closeup_path, return_proba=True,
+    )
+    if not timestamps:
+        return []
+    labels = viterbi_smooth(probs, cut_penalty)
+    return list(zip(timestamps, labels))

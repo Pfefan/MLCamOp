@@ -7,11 +7,12 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 import torchvision.transforms.v2 as T
+
+from src.utils.metrics import cut_event_prf, viterbi_smooth
 
 if TYPE_CHECKING:
     from src.data.sampler import SampleSet
@@ -48,32 +49,6 @@ _COLOR_AUGMENT = T.Compose([
     T.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5)),
 ])
 
-_CLOSEUP_EXTRA_BLUR = T.GaussianBlur(kernel_size=7, sigma=(0.5, 3.0))
-
-
-def _degrade_closeup(view: torch.Tensor) -> torch.Tensor:
-    """Apply a light corruption pass to close-up frames during training."""
-    _, h, w = view.shape
-    if torch.rand(1).item() < 0.7:
-        scale = 0.35 + 0.40 * torch.rand(1).item()
-        f     = view.float().unsqueeze(0)
-        small = F.interpolate(
-            f, scale_factor=scale,
-            mode="bilinear", align_corners=False, recompute_scale_factor=False,
-        )
-        f     = F.interpolate(small, size=(h, w), mode="bilinear", align_corners=False)
-        view  = f.squeeze(0).round().clamp_(0, 255).to(torch.uint8)
-
-    if torch.rand(1).item() < 0.5:
-        view = _CLOSEUP_EXTRA_BLUR(view)
-
-    if torch.rand(1).item() < 0.6:
-        sigma = 12.0 * torch.rand(1).item()
-        noise = torch.randn(view.shape) * sigma
-        view  = (view.float() + noise).round().clamp_(0, 255).to(torch.uint8)
-
-    return view
-
 
 def _augment_tensor(tensor: torch.Tensor) -> torch.Tensor:
     """Apply training-time image augmentation."""
@@ -83,10 +58,8 @@ def _augment_tensor(tensor: torch.Tensor) -> torch.Tensor:
         K = n_ch // 6
         parts: list[torch.Tensor] = []
         for k in range(K):
-            wide  = _COLOR_AUGMENT(tensor[k * 6     : k * 6 + 3])
-            close = _degrade_closeup(_COLOR_AUGMENT(tensor[k * 6 + 3 : k * 6 + 6]))
-            parts.append(wide)
-            parts.append(close)
+            parts.append(_COLOR_AUGMENT(tensor[k * 6     : k * 6 + 3]))
+            parts.append(_COLOR_AUGMENT(tensor[k * 6 + 3 : k * 6 + 6]))
         return torch.cat(parts, dim=0)
     return _SPATIAL_AUGMENT(_COLOR_AUGMENT(tensor))
 
@@ -344,6 +317,9 @@ class ViewClassifier:
         patience: int = 15,
         num_workers: int = _NUM_WORKERS,
         use_compile: bool = True,
+        cut_tolerance_samples: int = 2,
+        smooth_penalty: float = 0.1,
+        cutf1_checkpoint: Optional[str] = None,
     ) -> None:
         """Train the model with early stopping on balanced accuracy."""
         train_labels = [l for c in train_concerts for l in c.labels]
@@ -440,30 +416,50 @@ class ViewClassifier:
 
         best_bal_acc: float           = -1.0
         best_state:   Optional[dict]  = None
+        best_cut_f1:  float           = -1.0
+        best_cut_state: Optional[dict] = None
         no_improve:   int             = 0
+        val_labels_seq                = list(val_data.labels)
 
         for epoch in range(1, epochs + 1):
-            train_loss                    = self._run_epoch(train_loader, criterion, optimizer, scaler, training=True)
-            val_loss, val_acc, bal_acc    = self._evaluate(val_loader, criterion)
+            train_loss                        = self._run_epoch(train_loader, criterion, optimizer, scaler, training=True)
+            val_loss, val_acc, bal_acc, probs = self._evaluate(val_loader, criterion)
             scheduler.step()
+
+            smoothed = viterbi_smooth(probs, smooth_penalty)
+            cut_f1   = cut_event_prf(val_labels_seq, smoothed, cut_tolerance_samples)["f1"]
 
             print(
                 f"Epoch {epoch:02d}/{epochs} | "
                 f"Train: {train_loss:.4f} | "
                 f"Val: {val_loss:.4f} | "
                 f"Acc: {val_acc * 100:.1f}% | "
-                f"BalAcc: {bal_acc * 100:.1f}%"
+                f"BalAcc: {bal_acc * 100:.1f}% | "
+                f"CutF1: {cut_f1 * 100:.1f}%"
             )
 
-            if bal_acc > best_bal_acc:
+            improved_cut = cut_f1 > best_cut_f1
+            improved_bal = bal_acc > best_bal_acc
+            if improved_cut:
+                best_cut_f1    = cut_f1
+                best_cut_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+            if improved_bal:
                 best_bal_acc = bal_acc
                 best_state   = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
-                no_improve   = 0
+
+            # Stop only once neither objective has improved for `patience` epochs.
+            if improved_cut or improved_bal:
+                no_improve = 0
             else:
                 no_improve += 1
                 if no_improve >= patience:
-                    print(f"Early stopping at epoch {epoch} (patience={patience})")
+                    print(f"Early stopping at epoch {epoch} (patience={patience}) — neither BalAcc nor CutF1 improved")
                     break
+
+        if best_cut_state is not None and cutf1_checkpoint:
+            self.model.load_state_dict(best_cut_state)
+            self.save(cutf1_checkpoint)
+            print(f"Saved best-by-cut-F1 model ({best_cut_f1 * 100:.1f}%) to {cutf1_checkpoint}")
 
         if best_state is not None:
             self.model.load_state_dict(best_state)
@@ -507,11 +503,12 @@ class ViewClassifier:
 
         return total_loss / len(loader)
 
-    def _evaluate(self, loader: DataLoader, criterion: nn.Module) -> tuple[float, float, float]:
-        """Return (loss, accuracy, balanced_accuracy)."""
+    def _evaluate(self, loader: DataLoader, criterion: nn.Module) -> tuple[float, float, float, np.ndarray]:
+        """Return (loss, accuracy, balanced_accuracy, ordered_probs)."""
         total_loss = 0.0
         all_preds: list[int] = []
         all_labels: list[int] = []
+        all_probs: list[np.ndarray] = []
 
         self.model.eval()
         with torch.no_grad():
@@ -523,6 +520,7 @@ class ViewClassifier:
                 with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
                     outputs     = self._forward(batch_x, audio)
                     total_loss += ((criterion(outputs, batch_y) * batch_w).mean()).item()
+                all_probs.append(torch.softmax(outputs.float(), dim=1).cpu().numpy())
                 preds = torch.argmax(outputs, dim=1)
                 all_preds.extend(preds.cpu().tolist())
                 all_labels.extend(batch_y.cpu().tolist())
@@ -541,7 +539,11 @@ class ViewClassifier:
                 per_class_recall.append(recall)
         bal_acc = sum(per_class_recall) / len(per_class_recall)
 
-        return total_loss / len(loader), accuracy, bal_acc
+        probs_arr = (
+            np.concatenate(all_probs, axis=0) if all_probs
+            else np.zeros((0, self.num_classes), dtype=np.float32)
+        )
+        return total_loss / len(loader), accuracy, bal_acc, probs_arr
 
     def predict(self, frame: np.ndarray) -> int:
         """Predict a single frame using a repeated temporal window."""
@@ -550,6 +552,10 @@ class ViewClassifier:
 
     def predict_window(self, window_frames: list[np.ndarray], window_audio: np.ndarray | None = None) -> int:
         """Classify one causal window of frames."""
+        return int(self.predict_window_proba(window_frames, window_audio).argmax())
+
+    def predict_window_proba(self, window_frames: list[np.ndarray], window_audio: np.ndarray | None = None) -> np.ndarray:
+        """Class probabilities for one causal window of frames."""
         x = torch.cat([_frame_to_uint8_chw(f) for f in window_frames], dim=0)
         x = _normalize_windows(x.unsqueeze(0).to(self.device, non_blocking=True))
         audio = None
@@ -559,7 +565,7 @@ class ViewClassifier:
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
                 logits = self._forward(x, audio)
-        return int(torch.argmax(logits, dim=1).item())
+        return torch.softmax(logits.float(), dim=1).squeeze(0).cpu().numpy()
 
     def predict_batch(
         self,
