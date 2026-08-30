@@ -10,6 +10,7 @@ import yaml
 from src.data.sampler import (
     generate_training_data, split_dataset, concat_samplesets,
 )
+from src.data.audio import frame_audio_feature_dim
 from src.models.view_classifier import ViewClassifier, _NUM_WORKERS
 from src.utils.logger import setup_logger
 from src.utils.metrics import balanced_accuracy, cut_event_prf
@@ -89,7 +90,7 @@ def train_model(config: dict) -> None:
     n_train = sum(len(c) for c in train_concerts)
     logger.info("Split: %d train frames / %d val frames", n_train, len(val_data))
 
-    audio_dim = audio_cfg.get("n_mels", 32) if audio_cfg.get("enabled", False) else 0
+    audio_dim = frame_audio_feature_dim(audio_cfg.get("n_mels", 32)) if audio_cfg.get("enabled", False) else 0
     classifier = ViewClassifier(
         num_classes = config["model"].get("num_classes", 2),
         dual_frame  = dual_frame,

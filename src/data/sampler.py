@@ -145,7 +145,7 @@ def generate_training_data(
     if keep_transitions:
         key_parts.append(f"tr{transition_weight}")
     if audio_enabled:
-        key_parts.append(f"aud{audio_sample_rate}x{audio_n_mels}")
+        key_parts.append(f"aud{audio_sample_rate}x{audio_n_mels}pool")
     if cache_id:
         settings = hashlib.md5(f"{sample_fps}|{similarity_threshold}".encode()).hexdigest()[:6]
         base = f"{cache_id}_{settings}"
@@ -286,7 +286,7 @@ def generate_training_data(
     stacked_frames = frame_buf[:count]
     audio = all_audio[kept_positions] if all_audio is not None else None
     if audio is not None:
-        logger.info("Audio features ready: %d samples x %d mels", audio.shape[0], audio.shape[1])
+        logger.info("Audio features ready: %d samples x %d dims", audio.shape[0], audio.shape[1])
 
     torch.save(
         {
