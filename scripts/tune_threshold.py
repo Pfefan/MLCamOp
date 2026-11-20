@@ -20,9 +20,10 @@ def main(config: dict, concert_index: int = 0, check_split: bool = False) -> Non
     total_view = concert["total_view"]
     closeup    = concert["closeup"]
     result     = concert["result"]
+    metric     = config["data"].get("similarity_metric", "pixel")
 
     print(f"Concert {concert_index + 1}/{len(concerts)}: {total_view}")
-    print("Computing pixel-difference statistics (200 random samples)...")
+    print(f"Computing '{metric}' difference statistics (200 random samples)...")
     print("  Comparing result vs total_view  AND  result vs closeup ...\n")
 
     stats = compute_similarity_stats(
@@ -30,6 +31,7 @@ def main(config: dict, concert_index: int = 0, check_split: bool = False) -> Non
         closeup_path    = closeup,
         result_path     = result,
         n_samples       = 200,
+        metric          = metric,
     )
 
     for key, label in [("total", "result ↔ total_view"), ("closeup", "result ↔ closeup")]:
@@ -66,6 +68,7 @@ def main(config: dict, concert_index: int = 0, check_split: bool = False) -> Non
             cache_dir            = config["data"].get("cache_dir", "data/cache"),
             force_rebuild        = True,   # always re-evaluate at the new threshold
             cache_id             = concert.get("id"),
+            metric               = metric,
         )
         labels = data.labels
         n = len(labels)
@@ -78,7 +81,7 @@ def main(config: dict, concert_index: int = 0, check_split: bool = False) -> Non
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Tune the pixel-diff similarity threshold for one concert."
+        description="Tune the frame-similarity threshold for one concert."
     )
     parser.add_argument("--config", default="configs/model_config.yaml")
     parser.add_argument(

@@ -1,7 +1,8 @@
 """Wide-vs-close-up frame classifier."""
 
+import logging
 import os
-from typing import Optional, TYPE_CHECKING
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -12,16 +13,16 @@ from torch.utils.data import DataLoader
 from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 import torchvision.transforms.v2 as T
 
-from src.utils.metrics import cut_event_prf, viterbi_smooth
-
-if TYPE_CHECKING:
-    from src.data.sampler import SampleSet
+from src.data.sampler import SampleSet, balance_concert_weights
+from src.utils.metrics import balanced_accuracy, cut_event_prf, viterbi_smooth
 
 try:
     from tqdm import tqdm
     _TQDM_AVAILABLE = True
 except ImportError:
     _TQDM_AVAILABLE = False
+
+logger = logging.getLogger("ConcertVideoEditor")
 
 _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 _IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -56,12 +57,18 @@ def _augment_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if n_ch % 6 == 0:
         tensor = _SPATIAL_AUGMENT(tensor)
         K = n_ch // 6
-        parts: list[torch.Tensor] = []
-        for k in range(K):
-            parts.append(_COLOR_AUGMENT(tensor[k * 6     : k * 6 + 3]))
-            parts.append(_COLOR_AUGMENT(tensor[k * 6 + 3 : k * 6 + 6]))
-        return torch.cat(parts, dim=0)
+        h, w = tensor.shape[-2:]
+        views = tensor.reshape(K, 2, 3, h, w)
+        # One jitter draw per camera, shared across timesteps.
+        wide  = _COLOR_AUGMENT(views[:, 0])
+        close = _COLOR_AUGMENT(views[:, 1])
+        return torch.stack([wide, close], dim=1).reshape(n_ch, h, w)
     return _SPATIAL_AUGMENT(_COLOR_AUGMENT(tensor))
+
+
+def _augment_batch(windows: torch.Tensor) -> torch.Tensor:
+    """Augment every window of a batch with its own random draw, on the batch's device."""
+    return torch.stack([_augment_tensor(window) for window in windows])
 
 
 def _preprocess_frame(frame: np.ndarray) -> torch.Tensor:
@@ -85,7 +92,9 @@ def _preprocess_frame(frame: np.ndarray) -> torch.Tensor:
 
 
 def _frame_to_uint8_chw(frame: np.ndarray) -> torch.Tensor:
-    """Convert a BGR frame to an RGB uint8 CHW tensor."""
+    """Convert a frame to an RGB uint8 CHW tensor (no-op for cached CHW frames)."""
+    if frame.ndim == 3 and frame.shape[0] in (3, 6):
+        return torch.from_numpy(np.ascontiguousarray(frame))
     if frame.shape[1] != _INPUT_SIZE[0] or frame.shape[0] != _INPUT_SIZE[1]:
         frame = cv2.resize(frame, _INPUT_SIZE)
     if frame.ndim == 3 and frame.shape[2] == 6:
@@ -128,8 +137,11 @@ def _build_mobilenet(num_classes: int) -> nn.Module:
 class _DualStreamModel(nn.Module):
     """Shared-backbone temporal model over a causal window."""
 
-    _UNFREEZE_BLOCKS = 5
-    _COMPARISON_DIM = 576 * 4
+    # Learning-rate multiplier per unfrozen backbone block, deepest block first.
+    _UNFROZEN_LR_SCALES = (0.01, 0.1, 0.2)
+    _UNFREEZE_BLOCKS = len(_UNFROZEN_LR_SCALES)
+    _REDUCED_CHANNELS = 128
+    _COMPARISON_DIM = _REDUCED_CHANNELS * 4
 
     def __init__(self, num_classes: int = 2, rnn_hidden: int = _RNN_HIDDEN, audio_dim: int = 0):
         super().__init__()
@@ -137,6 +149,11 @@ class _DualStreamModel(nn.Module):
 
         self.features = base.features
         self.avgpool  = base.avgpool
+        self.reduce = nn.Sequential(
+            nn.Conv2d(576, self._REDUCED_CHANNELS, kernel_size=1, bias=False),
+            nn.BatchNorm2d(self._REDUCED_CHANNELS),
+            nn.Hardswish(),
+        )
 
         for param in self.features.parameters():
             param.requires_grad = False
@@ -156,28 +173,41 @@ class _DualStreamModel(nn.Module):
             nn.Linear(128, num_classes),
         )
 
+    def train(self, mode: bool = True) -> "_DualStreamModel":
+        """Switch train/eval mode while keeping the frozen blocks in eval mode.
+
+        Frozen blocks would otherwise re-estimate their BatchNorm statistics from
+        the training concerts and drift away from the pretrained weights they feed.
+        """
+        super().train(mode)
+        for block in self.features[: -self._UNFREEZE_BLOCKS]:
+            block.eval()
+        return self
+
     def _extract(self, x: torch.Tensor) -> torch.Tensor:
-        """Run one camera view through the shared backbone."""
+        """Run camera frames through the shared backbone."""
         x = x.contiguous(memory_format=torch.channels_last)
         x = self.features(x)
+        x = self.reduce(x)
         x = self.avgpool(x)
         return x.flatten(1)
 
     def forward(self, x: torch.Tensor, audio: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Run a window through the dual-stream model."""
-        K = x.shape[1] // 6
-        comparisons: list[torch.Tensor] = []
-        for k in range(K):
-            wide_feat  = self._extract(x[:, k * 6     : k * 6 + 3])
-            close_feat = self._extract(x[:, k * 6 + 3 : k * 6 + 6])
-            comparisons.append(torch.cat([
-                wide_feat,
-                close_feat,
-                torch.abs(wide_feat - close_feat),
-                wide_feat * close_feat,
-            ], dim=1))
+        batch, channels, height, width = x.shape
+        steps = channels // 6
+        # A single backbone pass over both cameras keeps the BatchNorm batch
+        # statistics mixed, like the running statistics used at inference.
+        feats = self._extract(x.reshape(batch * steps * 2, 3, height, width))
+        feats = feats.reshape(batch, steps, 2, -1)
+        wide_feat, close_feat = feats[:, :, 0], feats[:, :, 1]
 
-        seq = torch.stack(comparisons, dim=1)  # (B, K, comparison_dim)
+        seq = torch.cat([
+            wide_feat,
+            close_feat,
+            torch.abs(wide_feat - close_feat),
+            wide_feat * close_feat,
+        ], dim=2)                              # (B, K, comparison_dim)
         if audio is not None:
             seq = torch.cat([seq, audio], dim=2)
 
@@ -192,13 +222,11 @@ class _FrameDataset(torch.utils.data.Dataset):
         self,
         frames: np.ndarray,
         labels: list[int],
-        augment: bool = False,
         window: int = _TEMPORAL_WINDOW,
         lookahead: int = _LOOKAHEAD,
         weights: list[float] | None = None,
         audio: np.ndarray | None = None,
     ):
-        self.augment   = augment
         self.window    = window
         self.lookahead = lookahead
         if not isinstance(frames, np.ndarray):
@@ -208,9 +236,8 @@ class _FrameDataset(torch.utils.data.Dataset):
         self._build_index()
 
     @classmethod
-    def from_concerts(cls, concerts: list, augment: bool, window: int, lookahead: int) -> "_FrameDataset":
+    def from_concerts(cls, concerts: list, window: int, lookahead: int) -> "_FrameDataset":
         self = cls.__new__(cls)
-        self.augment   = augment
         self.window    = window
         self.lookahead = lookahead
         self._concerts = [(c.frames, c.labels, c.weights, c.audio) for c in concerts]
@@ -233,8 +260,6 @@ class _FrameDataset(torch.utils.data.Dataset):
         frames, labels, weights, audio = self._concerts[ci]
 
         tensor = self._build_window(frames, li)
-        if self.augment:
-            tensor = _augment_tensor(tensor)
 
         if self._legacy_pair:
             return tensor, labels[li]
@@ -254,11 +279,30 @@ class _FrameDataset(torch.utils.data.Dataset):
         return torch.cat([_frame_to_uint8_chw(frames[j]) for j in indices], dim=0)
 
 
-def _make_class_weights(labels: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Inverse-frequency class weights."""
-    counts  = torch.bincount(labels).float()
-    weights = counts.sum() / (len(counts) * counts)
-    return weights.to(device)
+def _validation_scores(
+    probs: np.ndarray,
+    concert_labels: list[list[int]],
+    smooth_penalty: float,
+    smooth_min_shot: int,
+    cut_tolerance_samples: int,
+) -> tuple[float, float, float]:
+    """Return (accuracy, balanced accuracy, smoothed cut-F1) for held-out concerts.
+
+    *probs* is the concatenation of the concerts' probabilities in order. Balanced
+    accuracy and cut-F1 are averaged per concert, so every held-out concert counts
+    equally and smoothing never runs across a concert boundary.
+    """
+    bounds = np.cumsum([len(labels) for labels in concert_labels])[:-1]
+    correct = 0
+    bal_accs: list[float] = []
+    cut_f1s:  list[float] = []
+    for labels, concert_probs in zip(concert_labels, np.split(probs, bounds)):
+        preds    = concert_probs.argmax(axis=1).tolist()
+        smoothed = viterbi_smooth(concert_probs, smooth_penalty, min_shot=smooth_min_shot)
+        correct += sum(p == l for p, l in zip(preds, labels))
+        bal_accs.append(balanced_accuracy(labels, preds))
+        cut_f1s.append(cut_event_prf(labels, smoothed, cut_tolerance_samples)["f1"])
+    return correct / len(probs), float(np.mean(bal_accs)), float(np.mean(cut_f1s))
 
 
 def _wrap_tqdm(iterable, **kwargs):
@@ -309,8 +353,8 @@ class ViewClassifier:
 
     def train(
         self,
-        train_concerts: list,
-        val_data: "SampleSet",
+        train_concerts: list[SampleSet],
+        val_concerts: list[SampleSet],
         epochs: int = 40,
         batch_size: int = 32,
         lr: float = 3e-4,
@@ -320,29 +364,39 @@ class ViewClassifier:
         cut_tolerance_samples: int = 2,
         smooth_penalty: float = 0.1,
         cutf1_checkpoint: Optional[str] = None,
+        label_smoothing: float = 0.1,
+        smooth_min_shot: int = 1,
+        prefetch_factor: int = 2,
     ) -> None:
-        """Train the model with early stopping on balanced accuracy."""
+        """Train the model with early stopping on balanced accuracy and cut-F1.
+
+        Both metrics are averaged over *val_concerts*, the held-out concerts.
+        """
         train_labels = [l for c in train_concerts for l in c.labels]
         n_train      = sum(len(c.frames) for c in train_concerts)
-        n_val        = len(val_data.frames)
+        n_val        = sum(len(c.frames) for c in val_concerts)
 
+        balanced_train = balance_concert_weights(train_concerts)
         train_ds = _FrameDataset.from_concerts(
-            train_concerts, augment=True, window=self.window, lookahead=self.lookahead,
+            balanced_train, window=self.window, lookahead=self.lookahead,
         )
         val_ds   = _FrameDataset.from_concerts(
-            [val_data], augment=False, window=self.window, lookahead=self.lookahead,
+            val_concerts, window=self.window, lookahead=self.lookahead,
         )
 
         pin = self.device.type == "cuda" and num_workers > 0
+        prefetch = prefetch_factor if num_workers > 0 else None
         train_loader = DataLoader(
             train_ds, batch_size=batch_size, shuffle=True,
             num_workers=num_workers, pin_memory=pin,
             persistent_workers=num_workers > 0,
+            prefetch_factor=prefetch,
         )
         val_loader = DataLoader(
             val_ds, batch_size=batch_size,
             num_workers=num_workers, pin_memory=pin,
             persistent_workers=num_workers > 0,
+            prefetch_factor=prefetch,
         )
 
         self._model_fwd = self.model
@@ -350,30 +404,27 @@ class ViewClassifier:
         if self.device.type == "cuda" and use_compile and not env_disabled:
             try:
                 self._model_fwd = torch.compile(self.model)
-                print("torch.compile: enabled")
+                logger.info("torch.compile: enabled")
             except Exception as exc:  # pragma: no cover - depends on backend
-                print(f"torch.compile unavailable ({exc}); running eager")
+                logger.info("torch.compile unavailable (%s); running eager", exc)
 
-        y_train = torch.tensor(train_labels, dtype=torch.long)
-        class_weights = _make_class_weights(y_train, self.device)
-        criterion     = nn.CrossEntropyLoss(weight=class_weights, reduction="none")
+        criterion = nn.CrossEntropyLoss(reduction="none", label_smoothing=label_smoothing)
 
         features = self.model.features
 
         if self.dual_frame:
-            head_params = list(self.model.head.parameters()) + list(self.model.temporal.parameters())
+            head_params = (
+                list(self.model.head.parameters())
+                + list(self.model.temporal.parameters())
+                + list(self.model.reduce.parameters())
+            )
             unfreeze = self.model._UNFREEZE_BLOCKS
-            # 3 tiers across the unfrozen blocks: deep → mid → top
-            deep_params = [p for b in self.model.features[-unfreeze    :-unfreeze//2] for p in b.parameters() if p.requires_grad]
-            mid_params  = [p for b in self.model.features[-unfreeze//2 :-2          ] for p in b.parameters() if p.requires_grad]
-            top_params  = [p for b in self.model.features[-2:                       ] for p in b.parameters() if p.requires_grad]
+            backbone_groups = [
+                {"params": list(block.parameters()), "lr": lr * scale}
+                for block, scale in zip(features[-unfreeze:], self.model._UNFROZEN_LR_SCALES)
+            ]
             optimizer = torch.optim.AdamW(
-                [
-                    {"params": deep_params, "lr": lr / 100},
-                    {"params": mid_params,  "lr": lr / 10},
-                    {"params": top_params,  "lr": lr / 5},
-                    {"params": head_params, "lr": lr},
-                ],
+                [*backbone_groups, {"params": head_params, "lr": lr}],
                 weight_decay=5e-3,
             )
         else:
@@ -406,36 +457,44 @@ class ViewClassifier:
 
         n_trainable = sum(p.numel() for g in optimizer.param_groups for p in g["params"])
         n_head = sum(p.numel() for p in head_params)
-        counts = torch.bincount(y_train)
-        print(f"Training on {n_train} | Validating on {n_val}")
-        print(f"Trainable parameters: {n_trainable:,}  (backbone: {n_trainable - n_head:,} | head: {n_head:,})")
-        print(f"Param groups: {' | '.join(f'{sum(p.numel() for p in g['params']):,} @ lr={g['lr']:.2e}' for g in optimizer.param_groups)}")
-        print(f"Train class counts — wide: {counts[0].item()}  close-up: {counts[1].item()}")
-        print(f"Class weights — wide: {class_weights[0]:.3f}  close-up: {class_weights[1]:.3f}")
-        print(f"Device: {self.device} | AMP: {use_amp} | Workers: {num_workers}")
+        sample_weights = [w for c in balanced_train for w in c.weights]
+        logger.info("Training on %d | Validating on %d", n_train, n_val)
+        logger.info(
+            "Trainable parameters: %s  (backbone: %s | head: %s)",
+            f"{n_trainable:,}", f"{n_trainable - n_head:,}", f"{n_head:,}",
+        )
+        logger.info("Param groups: %s", " | ".join(
+            f"{sum(p.numel() for p in g['params']):,} @ lr={g['lr']:.2e}" for g in optimizer.param_groups
+        ))
+        logger.info(
+            "Train class counts — wide: %d  close-up: %d",
+            train_labels.count(0), train_labels.count(1),
+        )
+        logger.info(
+            "Concert-balanced sample weights — min: %.2f  max: %.2f",
+            min(sample_weights), max(sample_weights),
+        )
+        logger.info("Device: %s | AMP: %s | Workers: %d", self.device, use_amp, num_workers)
 
         best_bal_acc: float           = -1.0
         best_state:   Optional[dict]  = None
         best_cut_f1:  float           = -1.0
         best_cut_state: Optional[dict] = None
         no_improve:   int             = 0
-        val_labels_seq                = list(val_data.labels)
+        val_labels                    = [list(c.labels) for c in val_concerts]
 
         for epoch in range(1, epochs + 1):
-            train_loss                        = self._run_epoch(train_loader, criterion, optimizer, scaler, training=True)
-            val_loss, val_acc, bal_acc, probs = self._evaluate(val_loader, criterion)
+            train_loss      = self._run_epoch(train_loader, criterion, optimizer, scaler, training=True)
+            val_loss, probs = self._evaluate(val_loader, criterion)
             scheduler.step()
 
-            smoothed = viterbi_smooth(probs, smooth_penalty)
-            cut_f1   = cut_event_prf(val_labels_seq, smoothed, cut_tolerance_samples)["f1"]
+            val_acc, bal_acc, cut_f1 = _validation_scores(
+                probs, val_labels, smooth_penalty, smooth_min_shot, cut_tolerance_samples,
+            )
 
-            print(
-                f"Epoch {epoch:02d}/{epochs} | "
-                f"Train: {train_loss:.4f} | "
-                f"Val: {val_loss:.4f} | "
-                f"Acc: {val_acc * 100:.1f}% | "
-                f"BalAcc: {bal_acc * 100:.1f}% | "
-                f"CutF1: {cut_f1 * 100:.1f}%"
+            logger.info(
+                "Epoch %02d/%d | Train: %.4f | Val: %.4f | Acc: %.1f%% | BalAcc: %.1f%% | CutF1: %.1f%%",
+                epoch, epochs, train_loss, val_loss, val_acc * 100, bal_acc * 100, cut_f1 * 100,
             )
 
             improved_cut = cut_f1 > best_cut_f1
@@ -453,17 +512,20 @@ class ViewClassifier:
             else:
                 no_improve += 1
                 if no_improve >= patience:
-                    print(f"Early stopping at epoch {epoch} (patience={patience}) — neither BalAcc nor CutF1 improved")
+                    logger.info(
+                        "Early stopping at epoch %d (patience=%d) — neither BalAcc nor CutF1 improved",
+                        epoch, patience,
+                    )
                     break
 
         if best_cut_state is not None and cutf1_checkpoint:
             self.model.load_state_dict(best_cut_state)
             self.save(cutf1_checkpoint)
-            print(f"Saved best-by-cut-F1 model ({best_cut_f1 * 100:.1f}%) to {cutf1_checkpoint}")
+            logger.info("Saved best-by-cut-F1 model (%.1f%%) to %s", best_cut_f1 * 100, cutf1_checkpoint)
 
         if best_state is not None:
             self.model.load_state_dict(best_state)
-            print(f"Restored best model — balanced accuracy: {best_bal_acc * 100:.1f}%")
+            logger.info("Restored best model — balanced accuracy: %.1f%%", best_bal_acc * 100)
 
         self.is_trained = True
 
@@ -481,15 +543,19 @@ class ViewClassifier:
 
         with torch.set_grad_enabled(training):
             for batch_x, batch_y, batch_w, batch_a in loader:
-                # uint8 window → GPU (4× smaller transfer) → normalise on GPU (#1).
-                batch_x = _normalize_windows(batch_x.to(self.device, non_blocking=True))
+                # Windows stay uint8 until they are on the device: 4× smaller transfer,
+                # and augmentation there is far cheaper than in the loader workers.
+                batch_x = batch_x.to(self.device, non_blocking=True)
+                if training:
+                    batch_x = _augment_batch(batch_x)
+                batch_x = _normalize_windows(batch_x)
                 batch_y = batch_y.to(self.device, non_blocking=True)
                 batch_w = batch_w.to(self.device, non_blocking=True).float()
                 audio   = batch_a.to(self.device).float() if batch_a.numel() else None
 
                 with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
                     outputs = self._forward(batch_x, audio)
-                    loss = (criterion(outputs, batch_y) * batch_w).mean()
+                    loss = (criterion(outputs, batch_y) * batch_w).sum() / batch_w.sum()
 
                 if training:
                     optimizer.zero_grad(set_to_none=True)
@@ -503,11 +569,9 @@ class ViewClassifier:
 
         return total_loss / len(loader)
 
-    def _evaluate(self, loader: DataLoader, criterion: nn.Module) -> tuple[float, float, float, np.ndarray]:
-        """Return (loss, accuracy, balanced_accuracy, ordered_probs)."""
+    def _evaluate(self, loader: DataLoader, criterion: nn.Module) -> tuple[float, np.ndarray]:
+        """Return (loss, class probabilities in loader order)."""
         total_loss = 0.0
-        all_preds: list[int] = []
-        all_labels: list[int] = []
         all_probs: list[np.ndarray] = []
 
         self.model.eval()
@@ -519,31 +583,14 @@ class ViewClassifier:
                 audio   = batch_a.to(self.device).float() if batch_a.numel() else None
                 with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
                     outputs     = self._forward(batch_x, audio)
-                    total_loss += ((criterion(outputs, batch_y) * batch_w).mean()).item()
+                    total_loss += ((criterion(outputs, batch_y) * batch_w).sum() / batch_w.sum()).item()
                 all_probs.append(torch.softmax(outputs.float(), dim=1).cpu().numpy())
-                preds = torch.argmax(outputs, dim=1)
-                all_preds.extend(preds.cpu().tolist())
-                all_labels.extend(batch_y.cpu().tolist())
-
-        correct = sum(p == l for p, l in zip(all_preds, all_labels))
-        accuracy = correct / len(all_labels)
-
-        preds_t = torch.tensor(all_preds)
-        labels_t = torch.tensor(all_labels)
-        n_classes = labels_t.max().item() + 1
-        per_class_recall = []
-        for c in range(n_classes):
-            mask    = labels_t == c
-            if mask.sum() > 0:
-                recall = (preds_t[mask] == c).float().mean().item()
-                per_class_recall.append(recall)
-        bal_acc = sum(per_class_recall) / len(per_class_recall)
 
         probs_arr = (
             np.concatenate(all_probs, axis=0) if all_probs
             else np.zeros((0, self.num_classes), dtype=np.float32)
         )
-        return total_loss / len(loader), accuracy, bal_acc, probs_arr
+        return total_loss / len(loader), probs_arr
 
     def predict(self, frame: np.ndarray) -> int:
         """Predict a single frame using a repeated temporal window."""
@@ -574,29 +621,8 @@ class ViewClassifier:
         batch_size: int = 128,
     ) -> list[int]:
         """Predict labels for a sequence of frames."""
-        self.model.eval()
-        all_preds: list[int] = []
-
-        if not isinstance(frames, np.ndarray):
-            frames = np.asarray(frames)
-        n = len(frames)
-
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-            windows, audio_windows = [], []
-            for idx in range(start, end):
-                indices = _causal_window_indices(idx, n, self.window, self.lookahead)
-                windows.append(torch.cat([_frame_to_uint8_chw(frames[j]) for j in indices], dim=0))
-                if audio is not None:
-                    audio_windows.append(torch.from_numpy(audio[indices]).float())
-            x = _normalize_windows(torch.stack(windows).to(self.device, non_blocking=True))
-            a = torch.stack(audio_windows).to(self.device) if audio is not None else None
-            with torch.no_grad():
-                with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
-                    logits = self._forward(x, a)
-            all_preds.extend(torch.argmax(logits, dim=1).cpu().tolist())
-
-        return all_preds
+        probs = self.predict_proba_batch(frames, audio=audio, batch_size=batch_size)
+        return probs.argmax(axis=1).astype(int).tolist()
 
     def predict_proba_batch(
         self,

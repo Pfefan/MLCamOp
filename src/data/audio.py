@@ -13,11 +13,12 @@ except ImportError:
 _HOP_LENGTH    = 512
 _CHUNK_SECONDS = 300
 _POOL_AGG      = 3  # mean, std, max per mel band
+_FLUX_AGG      = 2  # mean, max spectral flux per slot
 
 
 def frame_audio_feature_dim(n_mels: int) -> int:
-    """Feature width per sampled frame (mean/std/max pooling of the mel bands)."""
-    return n_mels * _POOL_AGG
+    """Feature width per sampled frame (pooled mel stats + spectral-flux stats)."""
+    return n_mels * _POOL_AGG + _FLUX_AGG
 
 
 def extract_frame_audio_features(
@@ -75,12 +76,15 @@ def _pool_and_standardize(mel: np.ndarray, times: np.ndarray, query: np.ndarray)
     Video is sampled sparsely (e.g. every 0.5 s) but audio is continuous, so each
     sampled timestamp aggregates mean/std/max over *all* mel frames in its slot
     instead of a single instant — no audio between samples is discarded.
+    Spectral flux (positive frame-to-frame energy rise = onset strength) is
+    pooled alongside: it is the note/beat-attack cue editors cut on, which
+    within-slot mean/std/max cannot capture.
     Standardising per clip removes concert-to-concert loudness differences.
     """
     n = len(query)
     m = mel.shape[1]
     if n == 0 or len(times) == 0:
-        return np.zeros((n, m * _POOL_AGG), dtype=np.float32)
+        return np.zeros((n, m * _POOL_AGG + _FLUX_AGG), dtype=np.float32)
 
     # Assign each mel frame to its nearest sample → contiguous, sorted partition.
     mids   = (query[:-1] + query[1:]) / 2.0 if n > 1 else np.array([np.inf])
@@ -95,7 +99,11 @@ def _pool_and_standardize(mel: np.ndarray, times: np.ndarray, query: np.ndarray)
     mx   = np.maximum.reduceat(mel,   starts, axis=0)
     mean = s / counts
     std  = np.sqrt(np.clip(s2 / counts - mean * mean, 0.0, None))
-    feat_present = np.concatenate([mean, std, mx], axis=1)   # (P, 3M)
+
+    flux      = np.concatenate([[0.0], np.maximum(np.diff(mel, axis=0), 0.0).sum(axis=1)])[:, None]
+    flux_mean = np.add.reduceat(flux, starts, axis=0) / counts
+    flux_max  = np.maximum.reduceat(flux, starts, axis=0)
+    feat_present = np.concatenate([mean, std, mx, flux_mean, flux_max], axis=1)  # (P, 3M+2)
 
     # Scatter to every sample; empty slots borrow the nearest populated one.
     if len(present) == 1:

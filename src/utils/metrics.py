@@ -148,17 +148,22 @@ def cut_event_prf(gt: list[int], pred: list[int], tolerance: int) -> dict:
     }
 
 
-def viterbi_smooth(probs: np.ndarray, switch_penalty: float) -> list[int]:
+def viterbi_smooth(probs: np.ndarray, switch_penalty: float, min_shot: int = 1) -> list[int]:
     """Decode the most likely label path from per-frame class probabilities.
 
     HMM Viterbi where emission = log P(class) and every camera switch costs
     *switch_penalty* log-units. Higher penalty => longer shots / fewer cuts.
     A penalty of 0 reduces to plain per-frame argmax.
+
+    ``min_shot`` > 1 adds a hard constraint: no switch is allowed until the
+    current shot has lasted at least *min_shot* samples (dwell-expanded HMM).
     """
     probs = np.asarray(probs, dtype=np.float64)
     n, k = probs.shape
     if n == 0:
         return []
+    if min_shot > 1:
+        return _viterbi_min_shot(probs, switch_penalty, min_shot)
     if switch_penalty <= 0.0:
         return probs.argmax(axis=1).astype(int).tolist()
 
@@ -182,12 +187,57 @@ def viterbi_smooth(probs: np.ndarray, switch_penalty: float) -> list[int]:
     return path.astype(int).tolist()
 
 
+def _viterbi_min_shot(probs: np.ndarray, switch_penalty: float, min_shot: int) -> list[int]:
+    """Viterbi over dwell-expanded states (class, time-in-shot capped at min_shot-1).
+
+    Switching into another class is only reachable from the max-dwell state, so
+    every emitted shot is guaranteed to span at least *min_shot* samples.
+    """
+    n, k = probs.shape
+    D = int(min_shot)
+    emission = np.log(np.clip(probs, 1e-8, 1.0))
+
+    dp = np.full((k, D), -np.inf)
+    dp[:, 0] = emission[0]
+    back = np.zeros((n, k, D), dtype=np.int32)  # encodes prev state as c*D+d
+
+    for t in range(1, n):
+        new    = np.full((k, D), -np.inf)
+        new_bk = np.zeros((k, D), dtype=np.int32)
+        for c in range(k):
+            # Stay in the same class: dwell advances (capped at D-1).
+            for d in range(D):
+                nd = min(d + 1, D - 1)
+                if dp[c, d] > new[c, nd]:
+                    new[c, nd]    = dp[c, d]
+                    new_bk[c, nd] = c * D + d
+            # Switch: only allowed once the previous shot reached full dwell.
+            for pc in range(k):
+                if pc == c:
+                    continue
+                score = dp[pc, D - 1] - switch_penalty
+                if score > new[c, 0]:
+                    new[c, 0]    = score
+                    new_bk[c, 0] = pc * D + (D - 1)
+        dp      = new + emission[t][:, None]
+        back[t] = new_bk
+
+    state = int(dp.argmax())
+    path  = np.zeros(n, dtype=np.int64)
+    path[-1] = state // D
+    for t in range(n - 1, 0, -1):
+        state    = int(back[t, state // D, state % D])
+        path[t - 1] = state // D
+    return path.astype(int).tolist()
+
+
 def calibrate_switch_penalty(
     probs:        np.ndarray,
     target_cuts:  int,
     lo:           float = 0.0,
     hi:           float = 25.0,
     iterations:   int   = 30,
+    min_shot:     int   = 1,
 ) -> float:
     """Bisection search for the penalty whose smoothed path has ~target_cuts.
 
@@ -195,7 +245,7 @@ def calibrate_switch_penalty(
     the penalty lands close to the desired pacing (e.g. the GT cut count).
     """
     def n_cuts(pen: float) -> int:
-        return len(cut_indices(viterbi_smooth(probs, pen)))
+        return len(cut_indices(viterbi_smooth(probs, pen, min_shot=min_shot)))
 
     if n_cuts(lo) <= target_cuts:
         return lo

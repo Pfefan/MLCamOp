@@ -4,30 +4,32 @@ data:
       total_view: "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/totalle_StadtkapelleWeiz_20251116_00004162.mp4"
       closeup: "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/closeup_StadtkapelleWeiz_20251116_00004162.mp4"
       result: "/mnt/Data/Job/Projekte/CutStudio/03_StadtkapelleWeiz_20251116/schnitt_StadtkapelleWeiz_20251116_00000000.mp4"
-      similarity_threshold: 31.1
 
     - id: kasernenfest
       total_view: "/mnt/Data/Job/Projekte/CutStudio/07_KsLiveKasernenfestjuli2026/KsLiveKasernenfest_totalle.mp4"
       closeup: "/mnt/Data/Job/Projekte/CutStudio/07_KsLiveKasernenfestjuli2026/KsLiveKasernenfest_closeup.mp4"
       result: "/mnt/Data/Job/Projekte/CutStudio/07_KsLiveKasernenfestjuli2026/KsLiveKasernenfest_schnitt.mp4"
-      similarity_threshold: 15.1
 
     - id: triotronik_messe
       total_view: "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/totalle.mp4"
       closeup: "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/closeup.mp4"
       result: "/mnt/Data/Job/Projekte/CutStudio/05_TriotronikMesse2025/rec.mp4"
-      similarity_threshold: 42.5
 
     - id: ubahnorchester
       total_view: "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/TOTALLE_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
       closeup: "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/CLOSEUP_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
       result: "/mnt/Data/Job/Projekte/CutStudio/04_Ubahnorchesterfuerstenfeld_20250830/SCHNITT_04_Ubahnorchesterfuerstenfeld_20250830.mp4"
-      similarity_threshold: 25.4
+
+  # Concert ids held out for validation; every other concert is trained on.
+  val_concerts: ["ubahnorchester"]
 
   sample_fps: 2.0
   cache_dir: "data/cache"
   force_rebuild: false
   dual_frame: true
+
+  similarity_metric: "ncc"
+  similarity_threshold: 0.5
 
   labeling:
     keep_transitions: true
@@ -44,8 +46,11 @@ training:
   learning_rate: 0.0005
   val_split: 0.2
   patience: 8
-  num_workers: 6
+  num_workers: 4
+  prefetch_factor: 4
   compile: false
+  label_smoothing: 0.1
+  seed: 42
 
 model:
   name: ViewClassifier
@@ -64,6 +69,7 @@ evaluation:
   smoothing:
     penalty_sweep: [0.0, 0.1, 0.25, 0.5, 1.0, 2.0]
     cut_penalty: 0.5
+    min_shot_sec: 2.0
 
 logging:
   log_file: "logs/training.log"

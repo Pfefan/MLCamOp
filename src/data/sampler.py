@@ -3,7 +3,7 @@
 import hashlib
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
@@ -28,10 +28,10 @@ _STORE_SIZE = (224, 224)
 class SampleSet:
     """Per-sample training arrays that must stay index-aligned through splitting.
 
-    frames:  (N, H, W, C) uint8 video frames.
+    frames:  (N, C, H, W) uint8 RGB frames (C=6 dual: wide + close-up stacked).
     labels:  hard nearest-camera class per frame (0 = wide, 1 = close-up).
     weights: per-sample loss weight; transition frames get < 1 (soft/uncertain).
-    audio:   (N, n_mels) log-mel features, or None when the audio branch is off.
+    audio:   (N, feature_dim) pooled audio features, or None when audio is off.
     """
 
     frames:  np.ndarray
@@ -53,6 +53,32 @@ def _pixel_diff(frame1: np.ndarray, frame2: np.ndarray) -> float:
     return float(np.mean(np.abs(_thumb(frame1) - _thumb(frame2))))
 
 
+def _ncc_dist(frame1: np.ndarray, frame2: np.ndarray) -> float:
+    """1 - normalised cross-correlation of grayscale thumbnails.
+
+    0 = identical, ~1 = uncorrelated, 2 = inverted. Invariant to global
+    brightness/contrast shifts (colour grading, encoding differences), so one
+    threshold works across concerts — unlike raw pixel diff.
+    """
+    a = cv2.cvtColor(cv2.resize(frame1, (_THUMB_W, _THUMB_H)), cv2.COLOR_BGR2GRAY).astype(np.float32)
+    b = cv2.cvtColor(cv2.resize(frame2, (_THUMB_W, _THUMB_H)), cv2.COLOR_BGR2GRAY).astype(np.float32)
+    a -= a.mean()
+    b -= b.mean()
+    denom = float(np.sqrt((a * a).sum() * (b * b).sum()))
+    if denom < 1e-6:
+        return 1.0
+    return 1.0 - float((a * b).sum()) / denom
+
+
+def _diff_fn(metric: str):
+    """Resolve the frame-similarity metric by name."""
+    if metric == "pixel":
+        return _pixel_diff
+    if metric == "ncc":
+        return _ncc_dist
+    raise ValueError(f"Unknown similarity metric: {metric!r} (expected 'pixel' or 'ncc')")
+
+
 def _open_video(path: str) -> cv2.VideoCapture:
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
@@ -71,36 +97,33 @@ def compute_similarity_stats(
     total_view_path: str,
     closeup_path:    str,
     result_path:     str,
-    sample_fps:      float = 1.0,
     n_samples:       int   = 200,
+    metric:          str   = "pixel",
 ) -> dict:
-    """Sample frames and compute diff statistics for threshold tuning."""
+    """Sample frames evenly across the videos and compute diff statistics for threshold tuning."""
+    diff = _diff_fn(metric)
     cap_total   = _open_video(total_view_path)
     cap_closeup = _open_video(closeup_path)
     cap_result  = _open_video(result_path)
 
-    video_fps      = cap_total.get(cv2.CAP_PROP_FPS) or 25.0
-    total_frames   = int(cap_total.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_interval = max(1, int(video_fps / sample_fps))
+    total_frames = int(cap_total.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    sample_indices = list(range(0, total_frames, frame_interval))[:n_samples]
-    last_sample = sample_indices[-1] if sample_indices else 0
+    # Spread samples over the whole video — the opening minutes are often
+    # wide-only, which skews the diff distributions.
+    sample_indices = np.linspace(0, max(0, total_frames - 1), n_samples, dtype=int).tolist()
 
     diffs_total: list[float] = []
     diffs_closeup: list[float] = []
 
-    idx = 0
-    while idx <= last_sample:
-        if not (cap_total.grab() and cap_closeup.grab() and cap_result.grab()):
-            break
-        if idx % frame_interval == 0:
-            ret_t, f_total   = cap_total.retrieve()
-            ret_c, f_closeup = cap_closeup.retrieve()
-            ret_r, f_result  = cap_result.retrieve()
-            if ret_t and ret_c and ret_r:
-                diffs_total.append(_pixel_diff(f_result, f_total))
-                diffs_closeup.append(_pixel_diff(f_result, f_closeup))
-        idx += 1
+    for idx in sample_indices:
+        for cap in (cap_total, cap_closeup, cap_result):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret_t, f_total   = cap_total.read()
+        ret_c, f_closeup = cap_closeup.read()
+        ret_r, f_result  = cap_result.read()
+        if ret_t and ret_c and ret_r:
+            diffs_total.append(diff(f_result, f_total))
+            diffs_closeup.append(diff(f_result, f_closeup))
 
     cap_total.release()
     cap_closeup.release()
@@ -138,16 +161,18 @@ def generate_training_data(
     audio_sample_rate:    int   = 16000,
     audio_n_mels:         int   = 32,
     cache_id:             str | None = None,
+    metric:               str   = "pixel",
 ) -> SampleSet:
     """Build a labelled sample set from the three concert videos."""
+    diff = _diff_fn(metric)
     os.makedirs(cache_dir, exist_ok=True)
-    key_parts = ["dual" if dual_frame else "single"]
+    key_parts = ["dual" if dual_frame else "single", metric]
     if keep_transitions:
         key_parts.append(f"tr{transition_weight}")
     if audio_enabled:
-        key_parts.append(f"aud{audio_sample_rate}x{audio_n_mels}pool")
+        key_parts.append(f"aud{audio_sample_rate}x{audio_n_mels}")
     if cache_id:
-        settings = hashlib.md5(f"{sample_fps}|{similarity_threshold}".encode()).hexdigest()[:6]
+        settings = hashlib.md5(f"{sample_fps}|{similarity_threshold}|{metric}".encode()).hexdigest()[:6]
         base = f"{cache_id}_{settings}"
     else:
         base = _cache_key(total_view_path, closeup_path, result_path,
@@ -156,24 +181,7 @@ def generate_training_data(
     cache_path = Path(cache_dir) / f"frames_{key}.pt"
 
     if not force_rebuild and cache_path.exists():
-        logger.info("Loading cached training data from %s", cache_path)
-        try:
-            data = torch.load(str(cache_path), weights_only=False, mmap=True)
-        except TypeError:
-            data = torch.load(str(cache_path), weights_only=False)
-
-        raw = data["frames"]
-        if isinstance(raw, list):
-            cached_frames = np.stack([f.numpy() for f in raw])
-        else:
-            cached_frames = np.ascontiguousarray(raw.numpy())
-
-        labels  = data["labels"].tolist()
-        weights = data["weights"].tolist() if "weights" in data else [1.0] * len(labels)
-        audio   = data["audio"].numpy() if data.get("audio") is not None else None
-        del data, raw
-        _print_label_summary(labels)
-        return SampleSet(cached_frames, labels, weights, audio)
+        return _load_cache(cache_path)
 
     cap_total   = _open_video(total_view_path)
     cap_closeup = _open_video(closeup_path)
@@ -207,7 +215,7 @@ def generate_training_data(
 
     store_w, store_h = _STORE_SIZE
     n_channels = 6 if dual_frame else 3
-    frame_buf = np.empty((len(sample_indices), store_h, store_w, n_channels), dtype=np.uint8)
+    frame_buf = np.empty((len(sample_indices), n_channels, store_h, store_w), dtype=np.uint8)
     count:          int              = 0
     labels:         list[int]        = []
     weights:        list[float]      = []
@@ -235,8 +243,8 @@ def generate_training_data(
                 progress.update(1)
 
             if ret_t and ret_c and ret_r:
-                diff_to_total   = _pixel_diff(f_result, f_total)
-                diff_to_closeup = _pixel_diff(f_result, f_closeup)
+                diff_to_total   = diff(f_result, f_total)
+                diff_to_closeup = diff(f_result, f_closeup)
 
                 wide_match    = diff_to_total   < similarity_threshold
                 closeup_match = diff_to_closeup < similarity_threshold
@@ -255,10 +263,13 @@ def generate_training_data(
 
                 if label is not None:
                     if dual_frame:
-                        frame_buf[count, :, :, :3] = cv2.resize(f_total,   _STORE_SIZE)
-                        frame_buf[count, :, :, 3:] = cv2.resize(f_closeup, _STORE_SIZE)
+                        frame_buf[count, :3] = cv2.cvtColor(
+                            cv2.resize(f_total, _STORE_SIZE), cv2.COLOR_BGR2RGB).transpose(2, 0, 1)
+                        frame_buf[count, 3:] = cv2.cvtColor(
+                            cv2.resize(f_closeup, _STORE_SIZE), cv2.COLOR_BGR2RGB).transpose(2, 0, 1)
                     else:
-                        frame_buf[count] = cv2.resize(f_total, _STORE_SIZE)
+                        frame_buf[count] = cv2.cvtColor(
+                            cv2.resize(f_total, _STORE_SIZE), cv2.COLOR_BGR2RGB).transpose(2, 0, 1)
                     labels.append(label)
                     weights.append(weight)
                     kept_positions.append(idx // frame_interval)
@@ -299,8 +310,101 @@ def generate_training_data(
     )
     logger.info("Cached %d labelled frames to %s", count, cache_path)
 
+    # Hand back the memory-mapped cache rather than the decoded buffer, so a
+    # freshly built concert costs no more RAM than a cached one.
+    return _load_cache(cache_path)
+
+
+def _load_cache(cache_path: Path) -> SampleSet:
+    """Memory-map a cached sample set."""
+    logger.info("Loading cached training data from %s", cache_path)
+    data    = torch.load(str(cache_path), weights_only=False, mmap=True)
+    labels  = data["labels"].tolist()
+    audio   = data["audio"].numpy() if data.get("audio") is not None else None
     _print_label_summary(labels)
-    return SampleSet(stacked_frames, labels, weights, audio)
+    return SampleSet(data["frames"].numpy(), labels, data["weights"].tolist(), audio)
+
+
+def load_concert(data_cfg: dict, concert: dict, force_rebuild: bool = False) -> SampleSet:
+    """Build (or load from cache) one concert's sample set.
+
+    *data_cfg* is the ``data`` section of the config and *concert* one entry of
+    its ``concerts`` list; a concert may override ``similarity_threshold``.
+    """
+    labeling  = data_cfg.get("labeling", {})
+    audio_cfg = data_cfg.get("audio", {})
+    return generate_training_data(
+        total_view_path      = concert["total_view"],
+        closeup_path         = concert["closeup"],
+        result_path          = concert["result"],
+        sample_fps           = data_cfg.get("sample_fps", 1.0),
+        similarity_threshold = concert.get("similarity_threshold",
+                                           data_cfg.get("similarity_threshold", 39)),
+        cache_dir            = data_cfg.get("cache_dir", "data/cache"),
+        force_rebuild        = force_rebuild,
+        dual_frame           = data_cfg.get("dual_frame", True),
+        keep_transitions     = labeling.get("keep_transitions", True),
+        transition_weight    = labeling.get("transition_weight", 0.3),
+        audio_enabled        = audio_cfg.get("enabled", False),
+        audio_sample_rate    = audio_cfg.get("sample_rate", 16000),
+        audio_n_mels         = audio_cfg.get("n_mels", 32),
+        cache_id             = concert.get("id"),
+        metric               = data_cfg.get("similarity_metric", "pixel"),
+    )
+
+
+def concert_name(concert: dict, index: int) -> str:
+    """Display name of a concert entry: its ``id``, else its 1-based position."""
+    return concert.get("id") or f"concert {index + 1}"
+
+
+def val_concert_indices(data_cfg: dict) -> list[int]:
+    """Positions of the held-out concerts in ``data.concerts``.
+
+    Concerts are held out by ``id`` through ``data.val_concerts``, so adding or
+    reordering concerts never changes the validation set. Without that key the
+    last concert is held out.
+    """
+    concerts = data_cfg["concerts"]
+    val_ids  = data_cfg.get("val_concerts")
+    if not val_ids:
+        return [len(concerts) - 1]
+
+    position = {concert.get("id"): i for i, concert in enumerate(concerts)}
+    unknown  = [val_id for val_id in val_ids if val_id not in position]
+    if unknown:
+        raise ValueError(f"data.val_concerts lists unknown concert id(s): {unknown}")
+    if len(set(val_ids)) >= len(concerts):
+        raise ValueError("data.val_concerts holds out every concert; nothing left to train on.")
+    return sorted(position[val_id] for val_id in set(val_ids))
+
+
+def balance_concert_weights(concerts: list[SampleSet]) -> list[SampleSet]:
+    """Rescale sample weights so every (concert, class) pair carries equal total weight.
+
+    Equal class mass inside each concert stops the model from using the venue as a
+    shortcut for that concert's wide/close-up ratio; equal mass per concert stops
+    long concerts from dominating. Relative weights inside a pair (down-weighted
+    transitions) are kept and the mean weight stays 1. For a single concert this
+    is plain inverse-frequency class weighting.
+    """
+    labels  = [np.asarray(concert.labels) for concert in concerts]
+    weights = [np.asarray(concert.weights, dtype=np.float64) for concert in concerts]
+    masses  = [
+        {cls: concert_weights[concert_labels == cls].sum() for cls in np.unique(concert_labels)}
+        for concert_labels, concert_weights in zip(labels, weights)
+    ]
+    n_pairs = sum(1 for concert_masses in masses for mass in concert_masses.values() if mass > 0)
+    target  = sum(len(concert_labels) for concert_labels in labels) / max(n_pairs, 1)
+
+    balanced: list[SampleSet] = []
+    for concert, concert_labels, concert_weights, concert_masses in zip(concerts, labels, weights, masses):
+        scale = np.zeros(len(concert_labels))
+        for cls, mass in concert_masses.items():
+            if mass > 0:
+                scale[concert_labels == cls] = target / mass
+        balanced.append(replace(concert, weights=(concert_weights * scale).tolist()))
+    return balanced
 
 
 def _print_label_summary(labels: list[int]) -> None:

@@ -14,7 +14,7 @@ Auto-cut between wide-shot and close-up concert cameras using a fine-tuned Mobil
 configs/model_config.yaml   # Video paths, hyperparameters, model checkpoint path
 scripts/
   train.py                  # Train the classifier
-  evaluate.py               # Evaluate on the held-out concert
+  evaluate.py               # Evaluate on the held-out concert(s)
   tune_threshold.py         # Calibrate pixel-diff threshold per concert
   preview.py                # Render an edited cut
 src/
@@ -48,7 +48,7 @@ python scripts/tune_threshold.py --concert 0
 # Train
 python scripts/train.py
 
-# Evaluate on the held-out concert
+# Evaluate on the held-out concert(s)
 python scripts/evaluate.py
 
 # Render an edited cut of a concert from the config
@@ -65,6 +65,26 @@ python scripts/preview.py \
 Everything is driven by `configs/model_config.yaml`: concert video paths, sampling rate, training hyperparameters, and the model checkpoint path.
 
 One knob worth knowing is the cut sensitivity under `evaluation.smoothing` — raise it for fewer, longer shots, lower it for more frequent cuts. It only affects editing, so you can tune it without retraining.
+
+### Adding a concert
+
+Append an entry with a unique `id` and the three video paths to `data.concerts`, then run `python scripts/train.py`. The first run decodes and caches the new concert; later runs memory-map the cache.
+
+```yaml
+data:
+  concerts:
+    - id: my_new_concert
+      total_view: "/path/to/wide.mp4"
+      closeup: "/path/to/closeup.mp4"
+      result: "/path/to/edit.mp4"
+  val_concerts: ["ubahnorchester"]
+```
+
+`data.val_concerts` lists the ids held out for validation; every other concert is trained on, so the position of an entry in the list does not matter. Scores are averaged per held-out concert. Keep the held-out set fixed when comparing runs, and hold out more than one concert once enough are available — a single concert is a noisy yardstick.
+
+Training weights samples so that every concert, and both classes inside each concert, contribute equally. A long concert or one with an unusual wide/close-up ratio therefore cannot dominate.
+
+Training progress (one line per epoch) is written to the console and to `logging.log_file`.
 
 ## Memory requirements
 

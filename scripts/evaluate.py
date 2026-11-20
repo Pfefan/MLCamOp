@@ -6,7 +6,9 @@ import numpy as np
 import yaml
 from sklearn.metrics import classification_report, confusion_matrix
 
-from src.data.sampler import generate_training_data, split_dataset
+from src.data.sampler import (
+    SampleSet, load_concert, concert_name, val_concert_indices, split_dataset,
+)
 from src.models.view_classifier import ViewClassifier
 from src.utils.logger import setup_logger
 from src.utils.metrics import (
@@ -21,64 +23,46 @@ from src.utils.metrics import (
 
 
 def evaluate(config: dict) -> None:
-    """Run the validation split and print metrics."""
+    """Report metrics for every held-out concert."""
     logger = setup_logger(config["logging"]["log_file"], config["logging"].get("level", "INFO"))
 
-    concerts   = config["data"]["concerts"]
-    sample_fps = config["data"].get("sample_fps", 1.0)
-    cache_dir  = config["data"].get("cache_dir", "data/cache")
-    dual_frame = config["data"].get("dual_frame", True)
-    labeling   = config["data"].get("labeling", {})
-    audio_cfg  = config["data"].get("audio", {})
-    val_split  = config["training"].get("val_split", 0.2)
-
-    logger.info("Loading frames (from cache if available)...")
-
-    def _load_concert(concert: dict):
-        threshold = concert.get("similarity_threshold",
-                                config["data"].get("similarity_threshold", 39))
-        return generate_training_data(
-            total_view_path      = concert["total_view"],
-            closeup_path         = concert["closeup"],
-            result_path          = concert["result"],
-            sample_fps           = sample_fps,
-            similarity_threshold = threshold,
-            cache_dir            = cache_dir,
-            dual_frame           = dual_frame,
-            keep_transitions     = labeling.get("keep_transitions", True),
-            transition_weight    = labeling.get("transition_weight", 0.3),
-            audio_enabled        = audio_cfg.get("enabled", False),
-            audio_sample_rate    = audio_cfg.get("sample_rate", 16000),
-            audio_n_mels         = audio_cfg.get("n_mels", 32),
-            cache_id             = concert.get("id"),
-        )
-
-    # Evaluation only needs the held-out concert; skip loading train concerts to
-    # avoid holding every frame of every concert in RAM at once.
-    if len(concerts) >= 2:
-        held_out = concerts[-1]
-        val_data = _load_concert(held_out)
-        ordered  = True
-        logger.info(
-            "Evaluating on held-out concert '%s' (%d frames) — train concerts not loaded.",
-            held_out.get("id", "last"), len(val_data),
-        )
-    else:
-        full = _load_concert(concerts[0])
-        _, val_data = split_dataset(full, val_split=val_split)
-        del full
-        ordered = False
-        logger.info("Evaluating on %d held-out frames...", len(val_data))
-
-    if len(val_data) == 0:
-        logger.error("No frames loaded. Check video paths.")
-        return
-
-    val_frames, val_labels = val_data.frames, val_data.labels
+    data_cfg = config["data"]
+    concerts = data_cfg["concerts"]
 
     logger.info("Loading model from %s...", config["model"]["checkpoint"])
     classifier = ViewClassifier()
     classifier.load(config["model"]["checkpoint"])
+
+    # Only the held-out concerts are loaded; train concerts stay on disk.
+    if len(concerts) >= 2:
+        for index in val_concert_indices(data_cfg):
+            name     = concert_name(concerts[index], index)
+            val_data = load_concert(data_cfg, concerts[index])
+            logger.info("Evaluating on held-out concert '%s' (%d frames).", name, len(val_data))
+            _report_concert(config, classifier, name, val_data, ordered=True, logger=logger)
+    else:
+        full = load_concert(data_cfg, concerts[0])
+        _, val_data = split_dataset(full, val_split=config["training"].get("val_split", 0.2))
+        logger.info("Evaluating on %d held-out frames...", len(val_data))
+        _report_concert(
+            config, classifier, concert_name(concerts[0], 0), val_data, ordered=False, logger=logger,
+        )
+
+
+def _report_concert(
+    config:     dict,
+    classifier: ViewClassifier,
+    concert:    str,
+    val_data:   SampleSet,
+    ordered:    bool,
+    logger,
+) -> None:
+    """Print frame-level metrics and, for a time-ordered concert, cut/pacing metrics."""
+    if len(val_data) == 0:
+        logger.error("No frames loaded for '%s'. Check video paths.", concert)
+        return
+
+    val_frames, val_labels = val_data.frames, val_data.labels
 
     probs       = classifier.predict_proba_batch(val_frames, audio=val_data.audio)
     predictions = probs.argmax(axis=1).astype(int).tolist()
@@ -87,7 +71,7 @@ def evaluate(config: dict) -> None:
     preds_arr  = np.array(predictions)
 
     print("\n" + "=" * 60)
-    print("EVALUATION RESULTS")
+    print(f"EVALUATION RESULTS — {concert}")
     print("=" * 60)
     print(classification_report(
         labels_arr,
@@ -110,7 +94,7 @@ def evaluate(config: dict) -> None:
     print(f"Balanced accuracy: {bal_acc  * 100:.1f}%")
     print(f"Wide recall:       {w_rec    * 100:.1f}%")
     print(f"Close-up recall:   {c_rec    * 100:.1f}%")
-    logger.info("Balanced accuracy: %.1f%%", bal_acc * 100)
+    logger.info("%s — balanced accuracy: %.1f%%", concert, bal_acc * 100)
 
     if ordered:
         sample_fps    = config["data"].get("sample_fps", 1.0)
@@ -130,7 +114,7 @@ def evaluate(config: dict) -> None:
             print(f"Cut events (±{tolerance_sec:.2f}s = ±{tolerance} samples):")
             print(f"  Ground-truth cuts: {ev['n_gt']}  |  Predicted cuts: {ev['n_pred']}  |  Matched: {ev['tp']}")
             print(f"  Precision: {ev['precision'] * 100:.1f}%  Recall: {ev['recall'] * 100:.1f}%  F1: {ev['f1'] * 100:.1f}%")
-            logger.info("%s cut-event F1: %.1f%%", title, ev["f1"] * 100)
+            logger.info("%s — %s cut-event F1: %.1f%%", concert, title, ev["f1"] * 100)
 
             pr_pace = pacing_stats(preds, sample_fps)
             print(f"Pacing — GT vs Pred:")
@@ -158,12 +142,16 @@ def evaluate(config: dict) -> None:
         # Sweep the switch penalty so the effect on pacing/cut-F1 is visible.
         smooth_cfg   = config.get("evaluation", {}).get("smoothing", {})
         sweep        = smooth_cfg.get("penalty_sweep", [0.5, 1.0, 2.0, 4.0, 8.0])
+        min_shot_sec = float(smooth_cfg.get("min_shot_sec", 0.0) or 0.0)
+        vit_min_shot = max(1, round(min_shot_sec * sample_fps))
         print(f"\n{'-' * 60}")
         print("SMOOTHING PENALTY SWEEP (Viterbi over class probabilities)")
+        if vit_min_shot > 1:
+            print(f"  (hard minimum shot length: {vit_min_shot} samples / {min_shot_sec:.1f}s)")
         print(f"  {'penalty':>8}  {'cuts/min':>9}  {'cuts':>6}  {'cut-F1':>7}")
         print(f"  {'GT':>8}  {gt_pace['cuts_per_min']:>9.2f}  {gt_pace['n_cuts']:>6d}  {'—':>7}")
         for pen in sweep:
-            sm  = viterbi_smooth(probs, float(pen))
+            sm  = viterbi_smooth(probs, float(pen), min_shot=vit_min_shot)
             ev  = cut_event_prf(val_labels, sm, tolerance)
             pc  = pacing_stats(sm, sample_fps)
             print(f"  {pen:>8.2f}  {pc['cuts_per_min']:>9.2f}  {pc['n_cuts']:>6d}  {ev['f1'] * 100:>6.1f}%")
@@ -174,10 +162,12 @@ def evaluate(config: dict) -> None:
             penalty = float(fixed_pen)
             how     = f"config cut_penalty={penalty:.2f}"
         else:
-            penalty = calibrate_switch_penalty(probs, target_cuts=len(cut_indices(val_labels)))
+            penalty = calibrate_switch_penalty(
+                probs, target_cuts=len(cut_indices(val_labels)), min_shot=vit_min_shot,
+            )
             how     = f"auto-calibrated to GT pacing (penalty={penalty:.2f})"
 
-        smoothed = viterbi_smooth(probs, penalty)
+        smoothed = viterbi_smooth(probs, penalty, min_shot=vit_min_shot)
         print(f"\n{'-' * 60}")
         report_preds(f"SMOOTHED — {how}", smoothed)
     else:
@@ -187,9 +177,16 @@ def evaluate(config: dict) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate the trained ViewClassifier.")
     parser.add_argument("--config", default="configs/model_config.yaml")
+    parser.add_argument(
+        "--checkpoint",
+        help="Override model.checkpoint from the config (e.g. models/view_classifier_cutf1.pt).",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
+
+    if args.checkpoint:
+        cfg["model"]["checkpoint"] = args.checkpoint
 
     evaluate(cfg)

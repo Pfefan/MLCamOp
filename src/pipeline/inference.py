@@ -123,6 +123,7 @@ def classify_video_smoothed(
     sample_fps:      float = 1.0,
     closeup_path:    str | None = None,
     cut_penalty:     float = 0.5,
+    min_shot:        int   = 1,
 ) -> list[tuple[float, int]]:
     """Classify then Viterbi-smooth the label sequence, matching the eval path."""
     timestamps, probs = classify_video(
@@ -131,5 +132,5 @@ def classify_video_smoothed(
     )
     if not timestamps:
         return []
-    labels = viterbi_smooth(probs, cut_penalty)
+    labels = viterbi_smooth(probs, cut_penalty, min_shot=min_shot)
     return list(zip(timestamps, labels))
